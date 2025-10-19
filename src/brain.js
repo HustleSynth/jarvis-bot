@@ -1,5 +1,8 @@
 import * as Vec3Module from 'vec3';
-import { Movements, goals as Goals } from 'mineflayer-pathfinder';
+// Import the CommonJS module as a default export
+import mineflayerPathfinder from 'mineflayer-pathfinder';
+// Destructure the named exports from the default export
+const { Movements, goals: Goals } = mineflayerPathfinder;
 
 const Vec3 = Vec3Module.Vec3 || Vec3Module.default || Vec3Module;
 
