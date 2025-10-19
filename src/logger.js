@@ -52,7 +52,7 @@ function wrapConsoleMethods({ chatOnly }) {
     return;
   }
 
-  const state = { chatOnly: !!chatOnly, promptRefresher: null };
+  const state = { chatOnly: !!chatOnly, promptRefresher: null, pendingRefresh: null };
   const originals = {
     log: console.log.bind(console),
     info: (console.info ?? console.log).bind(console),
@@ -82,13 +82,19 @@ function wrapConsoleMethods({ chatOnly }) {
   };
 
   const refreshPromptIfNeeded = () => {
+    if (state.pendingRefresh) return;
     const refresher = state.promptRefresher;
     if (typeof refresher !== 'function') return;
-    try {
-      refresher();
-    } catch (err) {
-      // ignore prompt refresh errors to avoid breaking logging
-    }
+    state.pendingRefresh = setImmediate(() => {
+      state.pendingRefresh = null;
+      const activeRefresher = state.promptRefresher;
+      if (typeof activeRefresher !== 'function') return;
+      try {
+        activeRefresher();
+      } catch (err) {
+        // ignore prompt refresh errors to avoid breaking logging
+      }
+    });
   };
 
   const wrap = (method) => (...args) => {
@@ -109,6 +115,10 @@ function wrapConsoleMethods({ chatOnly }) {
       state.chatOnly = !!options.chatOnly;
     },
     setPromptRefresher: (refresher) => {
+      if (state.pendingRefresh) {
+        clearImmediate(state.pendingRefresh);
+        state.pendingRefresh = null;
+      }
       state.promptRefresher = typeof refresher === 'function' ? refresher : null;
     },
     originals,

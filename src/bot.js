@@ -207,63 +207,87 @@ function setupCommandTerminal(bot, logger) {
 
   const state = { bot };
   try {
-    if (process.stdin.isTTY) {
-      process.stdin.resume();
+    if (process.stdin?.setEncoding) {
+      process.stdin.setEncoding('utf8');
     }
+    process.stdin?.resume?.();
   } catch (err) {
     // ignore failures when checking TTY status
   }
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true,
+  });
+  rl.resume?.();
   const promptText = '> ';
+  rl.setPrompt(promptText);
   let closed = false;
+  let refreshHandle = null;
   const consoleState = console.__jarvisConsoleState;
+  const schedulePromptRefresh = () => {
+    if (closed) return;
+    if (refreshHandle) return;
+    refreshHandle = setImmediate(() => {
+      refreshHandle = null;
+      if (closed) return;
+      try {
+        rl.resume?.();
+        rl.prompt(true);
+      } catch (err) {
+        logger.command?.(`Prompt refresh failed: ${err?.message ?? err}`);
+      }
+    });
+  };
+
+  const cancelScheduledRefresh = () => {
+    if (!refreshHandle) return;
+    clearImmediate(refreshHandle);
+    refreshHandle = null;
+  };
+
   const stdinErrorHandler = (err) => {
     logger.command?.(`STDIN error: ${err?.message ?? err}`);
+    schedulePromptRefresh();
   };
 
   if (typeof process.stdin.on === 'function') {
     process.stdin.on('error', stdinErrorHandler);
   }
 
-  const refreshPrompt = () => {
-    try {
-      rl.setPrompt(promptText);
-      rl.prompt(true);
-    } catch (err) {
-      // ignore prompt refresh errors
-    }
-  };
-
   const controller = {
     setBot(nextBot) {
       state.bot = nextBot;
+      schedulePromptRefresh();
     },
     clearBot() {
       state.bot = null;
     },
-    refreshPrompt,
+    refreshPrompt: schedulePromptRefresh,
     isClosed: () => closed,
     rl,
   };
 
-  refreshPrompt();
+  schedulePromptRefresh();
 
-  consoleState?.setPromptRefresher?.(() => {
+  const consolePromptUpdater = () => {
     if (!closed) {
-      refreshPrompt();
+      schedulePromptRefresh();
     }
-  });
+  };
+
+  consoleState?.setPromptRefresher?.(consolePromptUpdater);
 
   rl.on('line', (line) => {
     const cmd = line.trim();
     if (!cmd) {
-      refreshPrompt();
+      schedulePromptRefresh();
       return;
     }
     const activeBot = state.bot;
     if (!activeBot) {
       logger.command?.('No connected bot to receive manual command.');
-      refreshPrompt();
+      schedulePromptRefresh();
       return;
     }
     try {
@@ -272,23 +296,31 @@ function setupCommandTerminal(bot, logger) {
     } catch (err) {
       logger.command?.(`Failed to send manual command: ${err.message}`);
     }
-    refreshPrompt();
+    schedulePromptRefresh();
   });
 
   rl.on('close', () => {
     closed = true;
+    cancelScheduledRefresh();
     controller.clearBot();
     logger.command?.('Command terminal closed.');
     delete globalThis[COMMAND_TERMINAL_KEY];
     consoleState?.setPromptRefresher?.(null);
     if (typeof process.stdin.off === 'function') {
       process.stdin.off('error', stdinErrorHandler);
+    } else if (typeof process.stdin.removeListener === 'function') {
+      process.stdin.removeListener('error', stdinErrorHandler);
     }
   });
 
   rl.on('SIGINT', () => {
     logger.command?.('Press Ctrl+C again to exit.');
-    refreshPrompt();
+    schedulePromptRefresh();
+  });
+
+  rl.on('error', (err) => {
+    logger.command?.(`Readline error: ${err?.message ?? err}`);
+    schedulePromptRefresh();
   });
 
   globalThis[COMMAND_TERMINAL_KEY] = controller;
