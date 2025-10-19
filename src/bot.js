@@ -102,20 +102,36 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
 
   /**
    * Handle server‑sent resource packs automatically. When a server asks the
-   * client to download a resource pack, it emits a `resource_pack_send`
-   * event on the underlying client. By responding with
-   * `resource_pack_receive` and result code 3 we tell the server that
-   * the pack was successfully downloaded and applied. Mineflayer does not
-   * currently expose this natively, so hooking into the raw client is
-   * necessary. See https://wiki.vg/Protocol#Resource_Pack_Send for details.
+   * client to download a resource pack it will emit either a
+   * `resource_pack_send` (pre‑1.20.3) or `add_resource_pack` (1.20.3+)
+   * packet. To properly accept and apply the pack, the client must
+   * acknowledge receipt with result code `3` (accepted) and then confirm
+   * download completion with result code `0` (successfully loaded)【82116844194669†L444-L482】.
+   * Without sending both packets some servers (including Aternos and
+   * Hypixel) will stall while waiting, giving the appearance of a freeze.
    */
+  // For Minecraft <= 1.20.2: handle the legacy resource pack packet
   bot._client.on('resource_pack_send', (data) => {
     try {
       logger.info(`Server requested resource pack ${data.url} (hash: ${data.hash}). Automatically accepting.`);
-      // Send status 3 (successfully loaded) back to the server
+      // Report that the pack was accepted
       bot._client.write('resource_pack_receive', { hash: data.hash, result: 3 });
+      // Then report that it was successfully downloaded
+      bot._client.write('resource_pack_receive', { hash: data.hash, result: 0 });
     } catch (err) {
-      logger.warn(`Failed to handle resource pack: ${err.message}`);
+      logger.warn(`Failed to handle legacy resource pack: ${err.message}`);
+    }
+  });
+  // For Minecraft 1.20.3+: handle the updated resource pack packet with UUID
+  bot._client.on('add_resource_pack', (data) => {
+    try {
+      logger.info(`Server requested resource pack ${data.url} (uuid: ${data.uuid}). Automatically accepting.`);
+      // Report that the pack was accepted
+      bot._client.write('resource_pack_receive', { uuid: data.uuid, result: 3 });
+      // Then report that it was successfully downloaded
+      bot._client.write('resource_pack_receive', { uuid: data.uuid, result: 0 });
+    } catch (err) {
+      logger.warn(`Failed to handle modern resource pack: ${err.message}`);
     }
   });
 
