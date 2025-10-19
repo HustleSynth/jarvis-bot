@@ -101,46 +101,39 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
   }
 
   /**
-   * Handle server‑sent resource packs automatically. When a server asks the
-   * client to download a resource pack it will emit either a
-   * `resource_pack_send` (pre‑1.20.3) or `add_resource_pack` (1.20.3+)
-   * packet. To properly accept and apply the pack, the client must
-   * acknowledge receipt with result code `3` (accepted) and then confirm
-   * download completion with result code `0` (successfully loaded)【82116844194669†L444-L482】.
-   * Without sending both packets some servers (including Aternos and
-   * Hypixel) will stall while waiting, giving the appearance of a freeze.
+   * Handle server‑sent resource packs automatically. Mineflayer exposes a
+   * `resourcePack` event which fires whenever the server offers a pack.
+   * Calling `bot.acceptResourcePack()` tells the server you will download
+   * and apply the pack; Mineflayer then downloads it and sends the
+   * appropriate status codes (accepted and successfully loaded). This
+   * approach avoids connection stalls and ECONNABORTED errors on servers
+   * like Aternos.
    */
-  // For Minecraft <= 1.20.2: handle the legacy resource pack packet
-  bot._client.on('resource_pack_send', (data) => {
+  bot.on('resourcePack', (url, hash) => {
+    // Log the request and delegate downloading to mineflayer
+    logger.info(`Server requested resource pack ${url}. Accepting and downloading...`);
     try {
-      logger.info(`Server requested resource pack ${data.url} (hash: ${data.hash}). Automatically accepting.`);
-      // Report that the pack was accepted
-      bot._client.write('resource_pack_receive', { hash: data.hash, result: 3 });
-      // Then report that it was successfully downloaded
-      bot._client.write('resource_pack_receive', { hash: data.hash, result: 0 });
+      // acceptResourcePack() is synchronous in some mineflayer versions.
+      // It returns void rather than a Promise, so calling .catch() will
+      // throw a TypeError. Wrap the call in try/catch instead.
+      bot.acceptResourcePack();
     } catch (err) {
-      logger.warn(`Failed to handle legacy resource pack: ${err.message}`);
-    }
-  });
-  // For Minecraft 1.20.3+: handle the updated resource pack packet with UUID
-  bot._client.on('add_resource_pack', (data) => {
-    try {
-      logger.info(`Server requested resource pack ${data.url} (uuid: ${data.uuid}). Automatically accepting.`);
-      // Report that the pack was accepted
-      bot._client.write('resource_pack_receive', { uuid: data.uuid, result: 3 });
-      // Then report that it was successfully downloaded
-      bot._client.write('resource_pack_receive', { uuid: data.uuid, result: 0 });
-    } catch (err) {
-      logger.warn(`Failed to handle modern resource pack: ${err.message}`);
+      logger.warn(`Failed to download resource pack: ${err.message}`);
     }
   });
 
   const autonomy = enableAutonomousBrain(bot, logger, behaviorConfig, aiController);
   const commandRegistry = registerCommands(bot, logger, aiController, behaviorConfig, autonomy);
 
+  // Only send vanilla-like client settings on login. Avoid sending the
+  // optional client brand handshake, which can cause write errors on some
+  // servers (e.g. Aternos) and is not required for vanilla play.
+  // When the bot logs in, do not send any optional client brand or settings.
+  // Vanilla servers provide sensible defaults, and sending custom settings
+  // can trigger aborted connections on some hosts. If you need specific
+  // settings, adjust them via bot.options instead of custom packets.
   bot.once('login', () => {
-    sendClientBrand(bot, logger, sessionConfig);
-    sendClientSettings(bot, logger, sessionConfig);
+    logger.debug('Logged in; skipping client brand and settings handshakes.');
   });
 
   bot.once('spawn', () => {
