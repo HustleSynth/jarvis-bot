@@ -1,4 +1,8 @@
-import { Movements, goals as Goals } from 'mineflayer-pathfinder';
+// Correct import for CJS default export
+import mineflayerPathfinder from 'mineflayer-pathfinder';
+
+// Destructure the needed properties
+const { Movements, goals: Goals } = mineflayerPathfinder;
 
 function parseCoordinates(bot, args) {
   if (args.length === 3) {
@@ -103,9 +107,7 @@ export function registerCommands(bot, logger, aiController, behavior, autonomy) 
       })
       .catch((error) => {
         logger.warn(`Command failed: ${error.message || error}`);
-        if (error?.stack) {
-          logger.debug(error.stack);
-        }
+        if (error?.stack) logger.debug(error.stack);
         bot.chat(error.message || 'Command failed');
       });
   }
