@@ -9,6 +9,8 @@ import { plugin as collectBlockPlugin } from 'mineflayer-collectblock';
 import { registerCommands } from './commands.js';
 import { enableAutonomousBrain } from './autonomy.js';
 
+const COMMAND_TERMINAL_KEY = Symbol.for('jarvis.commandTerminal');
+
 function randomDelay(min, max) {
   const low = Math.min(min, max);
   const high = Math.max(min, max);
@@ -68,6 +70,38 @@ function stripMinecraftFormatting(message) {
     return String(message).trim();
   }
   return message.replace(/§[0-9a-fklmnor]/gi, '').trim();
+}
+
+function collapseChatComponent(component) {
+  if (component === null || component === undefined) return '';
+  if (typeof component === 'string') return component;
+  if (Buffer.isBuffer(component)) {
+    return component.toString('utf8');
+  }
+  if (Array.isArray(component)) {
+    return component.map((part) => collapseChatComponent(part)).join('');
+  }
+  if (typeof component === 'object') {
+    const text = component.text ? String(component.text) : '';
+    const extra = Array.isArray(component.extra)
+      ? component.extra.map((part) => collapseChatComponent(part)).join('')
+      : '';
+    if (text || extra) {
+      return text + extra;
+    }
+    try {
+      return JSON.stringify(component);
+    } catch (err) {
+      return String(component);
+    }
+  }
+  return String(component);
+}
+
+function formatDisconnectReason(reason) {
+  const raw = collapseChatComponent(reason);
+  const cleaned = stripMinecraftFormatting(raw);
+  return cleaned || 'Unknown';
 }
 
 /**
@@ -160,23 +194,57 @@ function maybeHandleAuthPrompts(bot, message, authState, behaviorConfig, logger)
  * commands (e.g. "/home" or "say hello"), simply type them and hit enter.
  */
 function setupCommandTerminal(bot, logger) {
+  const existing = globalThis[COMMAND_TERMINAL_KEY];
+  if (existing) {
+    existing.setBot(bot);
+    return existing;
+  }
+
+  const state = { bot };
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  const controller = {
+    setBot(nextBot) {
+      state.bot = nextBot;
+    },
+    clearBot() {
+      state.bot = null;
+    },
+    rl,
+  };
+
   rl.on('line', (line) => {
     const cmd = line.trim();
     if (!cmd) return;
+    const activeBot = state.bot;
+    if (!activeBot) {
+      logger.server?.('No connected bot to receive manual command.');
+      return;
+    }
     try {
-      bot.chat(cmd);
-      logger.debug(`Manual command sent: ${cmd}`);
+      activeBot.chat(cmd);
     } catch (err) {
-      logger.warn(`Failed to send manual command: ${err.message}`);
+      logger.server?.(`Failed to send manual command: ${err.message}`);
     }
   });
+
   rl.on('close', () => {
-    logger.info('Command terminal closed.');
+    controller.clearBot();
+    logger.server?.('Command terminal closed.');
   });
+
+  globalThis[COMMAND_TERMINAL_KEY] = controller;
+  return controller;
 }
 
-export function createBot(botConfig, aiController, behaviorConfig, sessionConfig, logger) {
+export function createBot(
+  botConfig,
+  aiController,
+  behaviorConfig,
+  sessionConfig,
+  logger,
+  lifecycleHandlers = {}
+) {
   const bot = mineflayer.createBot({
     host: botConfig.host,
     port: botConfig.port,
@@ -198,6 +266,17 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
     loginSent: false,
     registerSentAt: 0,
     loginSentAt: 0,
+  };
+
+  const lifecycle = lifecycleHandlers ?? {};
+  const terminalController = setupCommandTerminal(bot, logger);
+  terminalController?.setBot?.(bot);
+  let terminationNotified = false;
+
+  const notifyDisconnect = (reasonText, meta = {}) => {
+    if (terminationNotified) return;
+    terminationNotified = true;
+    lifecycle.onDisconnect?.(reasonText, meta);
   };
 
   /**
@@ -274,6 +353,7 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
 
   bot.once('spawn', () => {
     logger.info(`Spawned at ${bot.entity.position}`);
+    logger.server?.(`Spawned at ${bot.entity.position}`);
     if (aiController?.enabled) {
       aiController.appendHistory('system', 'Bot spawned in the world.');
     }
@@ -292,6 +372,8 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
         }, delay);
       }
     }
+
+    lifecycle.onSpawn?.(bot);
   });
 
   bot.on('chat', (username, message) => {
@@ -486,17 +568,31 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
       return;
     }
     logger.error('Bot encountered an error', error);
+    const message = error?.message ? `Bot error: ${error.message}` : 'Bot encountered an unknown error.';
+    logger.server?.(message);
+    lifecycle.onError?.(error);
+  });
+
+  bot.on('kicked', (reason) => {
+    const text = formatDisconnectReason(reason);
+    logger.server?.(`Kicked from server${text ? `: ${text}` : ''}`);
+    lifecycle.onKicked?.(text);
+    notifyDisconnect(text, { type: 'kicked' });
   });
 
   bot.on('end', (reason) => {
-    logger.warn(`Bot disconnected: ${reason}`);
+    const text = formatDisconnectReason(reason);
+    logger.warn(`Bot disconnected: ${text}`);
+    logger.server?.(`Connection closed${text ? `: ${text}` : ''}`);
+    notifyDisconnect(text, { type: 'end' });
+    terminalController?.clearBot?.();
   });
 
   // Expose a command terminal on stdin for manual control. This should be set up
   // after creating the bot so the user can type commands into the console and
   // have them sent directly to the game. It runs immediately and does not wait
   // for spawn, so commands entered before join will be queued by Mineflayer.
-  setupCommandTerminal(bot, logger);
+  // Already configured above via setupCommandTerminal/bot binding.
 
   return bot;
 }
