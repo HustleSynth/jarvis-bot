@@ -52,7 +52,7 @@ function wrapConsoleMethods({ chatOnly }) {
     return;
   }
 
-  const state = { chatOnly: !!chatOnly };
+  const state = { chatOnly: !!chatOnly, promptRefresher: null };
   const originals = {
     log: console.log.bind(console),
     info: (console.info ?? console.log).bind(console),
@@ -81,10 +81,21 @@ function wrapConsoleMethods({ chatOnly }) {
     return true;
   };
 
+  const refreshPromptIfNeeded = () => {
+    const refresher = state.promptRefresher;
+    if (typeof refresher !== 'function') return;
+    try {
+      refresher();
+    } catch (err) {
+      // ignore prompt refresh errors to avoid breaking logging
+    }
+  };
+
   const wrap = (method) => (...args) => {
     if (shouldSuppress(method, args)) return;
     const writer = originals[method] ?? originals.log;
     writer(...args);
+    refreshPromptIfNeeded();
   };
 
   console.log = wrap('log');
@@ -96,6 +107,9 @@ function wrapConsoleMethods({ chatOnly }) {
   console.__jarvisConsoleState = {
     update: (options = {}) => {
       state.chatOnly = !!options.chatOnly;
+    },
+    setPromptRefresher: (refresher) => {
+      state.promptRefresher = typeof refresher === 'function' ? refresher : null;
     },
     originals,
     state,

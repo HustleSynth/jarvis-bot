@@ -206,14 +206,29 @@ function setupCommandTerminal(bot, logger) {
   }
 
   const state = { bot };
+  try {
+    if (process.stdin.isTTY) {
+      process.stdin.resume();
+    }
+  } catch (err) {
+    // ignore failures when checking TTY status
+  }
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const promptText = '> ';
   let closed = false;
+  const consoleState = console.__jarvisConsoleState;
+  const stdinErrorHandler = (err) => {
+    logger.command?.(`STDIN error: ${err?.message ?? err}`);
+  };
+
+  if (typeof process.stdin.on === 'function') {
+    process.stdin.on('error', stdinErrorHandler);
+  }
 
   const refreshPrompt = () => {
     try {
       rl.setPrompt(promptText);
-      rl.prompt();
+      rl.prompt(true);
     } catch (err) {
       // ignore prompt refresh errors
     }
@@ -232,6 +247,12 @@ function setupCommandTerminal(bot, logger) {
   };
 
   refreshPrompt();
+
+  consoleState?.setPromptRefresher?.(() => {
+    if (!closed) {
+      refreshPrompt();
+    }
+  });
 
   rl.on('line', (line) => {
     const cmd = line.trim();
@@ -259,6 +280,15 @@ function setupCommandTerminal(bot, logger) {
     controller.clearBot();
     logger.command?.('Command terminal closed.');
     delete globalThis[COMMAND_TERMINAL_KEY];
+    consoleState?.setPromptRefresher?.(null);
+    if (typeof process.stdin.off === 'function') {
+      process.stdin.off('error', stdinErrorHandler);
+    }
+  });
+
+  rl.on('SIGINT', () => {
+    logger.command?.('Press Ctrl+C again to exit.');
+    refreshPrompt();
   });
 
   globalThis[COMMAND_TERMINAL_KEY] = controller;
