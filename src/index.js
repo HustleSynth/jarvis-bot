@@ -9,7 +9,7 @@ import { createLogger } from './logger.js';
 import { AiController } from './ai.js';
 import { createBot } from './bot.js';
 
-const logger = createLogger(logConfig.level);
+const logger = createLogger(logConfig.level, logConfig);
 
 async function main() {
   const aiController = new AiController(aiConfig, logger);
