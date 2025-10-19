@@ -62,6 +62,14 @@ function queueHumanLikeChat(bot, message, behaviorConfig) {
   }, delay);
 }
 
+function stripMinecraftFormatting(message) {
+  if (typeof message !== 'string') {
+    if (message === null || message === undefined) return '';
+    return String(message).trim();
+  }
+  return message.replace(/§[0-9a-fklmnor]/gi, '').trim();
+}
+
 /**
  * Send registration and login commands after CAPTCHA is solved.
  * Many servers require the player to register and/or log in using
@@ -71,7 +79,7 @@ function queueHumanLikeChat(bot, message, behaviorConfig) {
  * respects the `authState` flags to avoid sending duplicates. Commands
  * are sent with a random human‑like delay using `queueHumanLikeChat`.
  */
-function sendAuthCommandsIfNeeded(bot, authState, behaviorConfig) {
+function sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger) {
   if (!behaviorConfig?.auth) return;
   const { auth } = behaviorConfig;
   const captchaRequired = auth.requireCaptcha === true;
@@ -83,6 +91,7 @@ function sendAuthCommandsIfNeeded(bot, authState, behaviorConfig) {
     const delay = randomDelay(1500, 3000);
     setTimeout(() => {
       queueHumanLikeChat(bot, auth.registerCommand, behaviorConfig);
+      logger?.auth?.('Sent automatic register command.');
     }, delay);
   }
 
@@ -92,11 +101,12 @@ function sendAuthCommandsIfNeeded(bot, authState, behaviorConfig) {
     const delay = randomDelay(2500, 4000);
     setTimeout(() => {
       queueHumanLikeChat(bot, auth.loginCommand, behaviorConfig);
+      logger?.auth?.('Sent automatic login command.');
     }, delay);
   }
 }
 
-function maybeHandleAuthPrompts(bot, message, authState, behaviorConfig) {
+function maybeHandleAuthPrompts(bot, message, authState, behaviorConfig, logger) {
   if (!behaviorConfig?.auth?.enabled) return;
   const { auth } = behaviorConfig;
   const lower = message.toLowerCase();
@@ -130,7 +140,17 @@ function maybeHandleAuthPrompts(bot, message, authState, behaviorConfig) {
     authState.loginSent = false;
   }
 
-  sendAuthCommandsIfNeeded(bot, authState, behaviorConfig);
+  if (registerPrompt || loginPrompt) {
+    logger?.auth?.(
+      registerPrompt && loginPrompt
+        ? 'Server requested both register and login. Ensuring commands are queued.'
+        : registerPrompt
+          ? 'Server requested registration. Ensuring register command is queued.'
+          : 'Server requested login. Ensuring login command is queued.'
+    );
+  }
+
+  sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
 }
 
 /**
@@ -268,7 +288,7 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
         authState.captchaSolved = true;
         const delay = randomDelay(2200, 4200);
         setTimeout(() => {
-          sendAuthCommandsIfNeeded(bot, authState, behaviorConfig);
+          sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
         }, delay);
       }
     }
@@ -319,24 +339,32 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
    * and should work with most AuthMe‑style CAPTCHA plugins【633009359541956†L390-L396】.
    */
   bot.on('messagestr', (message) => {
-    maybeHandleAuthPrompts(bot, message, authState, behaviorConfig);
+    const plainMessage = stripMinecraftFormatting(message);
+    if (plainMessage) {
+      const isPlayerChat = /^<[^>]+>\s/.test(plainMessage);
+      if (!isPlayerChat) {
+        logger.server?.(plainMessage);
+      }
+    }
+
+    maybeHandleAuthPrompts(bot, plainMessage, authState, behaviorConfig, logger);
 
     // Normalize the message to lower case for keyword checks but keep original for regex
-    const lower = message.toLowerCase();
+    const lower = plainMessage.toLowerCase();
     let handled = false;
 
     // Pattern 1: a command like "/captcha abcd123" or "need_captcha type: /captcha 1234"
-    const codeCmdMatch = message.match(/\/captcha\s+([0-9a-zA-Z]+)/i);
+    const codeCmdMatch = plainMessage.match(/\/captcha\s+([0-9a-zA-Z]+)/i);
     if (!handled && codeCmdMatch) {
       const code = codeCmdMatch[1];
-      logger.debug(`Detected CAPTCHA code '${code}' in message: ${message}`);
+      logger.captcha?.(`Detected CAPTCHA command: ${plainMessage}`);
       const delay = randomDelay(700, 1400);
       setTimeout(() => {
         try {
           bot.chat(`/captcha ${code}`);
-          logger.debug(`Sent /captcha ${code} to solve CAPTCHA`);
+          logger.captcha?.(`Solved CAPTCHA by sending /captcha ${code}.`);
           authState.captchaSolved = true;
-          sendAuthCommandsIfNeeded(bot, authState, behaviorConfig);
+          sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
         } catch (err) {
           logger.warn(`Failed to send CAPTCHA response: ${err.message}`);
         }
@@ -346,22 +374,22 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
 
     // Pattern 2: a standalone code after the word "captcha" (with optional "code" label)
     if (!handled && lower.includes('captcha')) {
-      const codeStandaloneMatch = message.match(/captcha(?:\s*code)?\s*[:]?\s*([0-9A-Za-z]{3,10})/i);
+      const codeStandaloneMatch = plainMessage.match(/captcha(?:\s*code)?\s*[:]?\s*([0-9A-Za-z]{3,10})/i);
       if (codeStandaloneMatch) {
         const code = codeStandaloneMatch[1];
-        logger.debug(`Detected standalone CAPTCHA code '${code}' in message: ${message}`);
+        logger.captcha?.(`Detected CAPTCHA code ${code} in message: ${plainMessage}`);
         const delay = randomDelay(700, 1400);
         setTimeout(() => {
           try {
-            if (/\/captcha/i.test(message)) {
+            if (/\/captcha/i.test(plainMessage)) {
               bot.chat(`/captcha ${code}`);
-              logger.debug(`Sent /captcha ${code} to solve CAPTCHA`);
+              logger.captcha?.(`Solved CAPTCHA by sending /captcha ${code}.`);
             } else {
               bot.chat(code);
-              logger.debug(`Sent raw code '${code}' to solve CAPTCHA`);
+              logger.captcha?.(`Solved CAPTCHA by sending code ${code}.`);
             }
             authState.captchaSolved = true;
-            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig);
+            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
           } catch (err) {
             logger.warn(`Failed to send CAPTCHA response: ${err.message}`);
           }
@@ -372,22 +400,22 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
 
     // Pattern 3: a generic verification code preceded by "code" or "verification code"
     if (!handled) {
-      const codeGenericMatch = message.match(/(?:verification\s*)?code\s*[:]?\s*([0-9A-Za-z]{3,10})/i);
+      const codeGenericMatch = plainMessage.match(/(?:verification\s*)?code\s*[:]?\s*([0-9A-Za-z]{3,10})/i);
       if (codeGenericMatch) {
         const code = codeGenericMatch[1];
-        logger.debug(`Detected generic code '${code}' in message: ${message}`);
+        logger.captcha?.(`Detected verification code ${code} in message: ${plainMessage}`);
         const delay = randomDelay(700, 1400);
         setTimeout(() => {
           try {
-            if (/\/captcha/i.test(message)) {
+            if (/\/captcha/i.test(plainMessage)) {
               bot.chat(`/captcha ${code}`);
-              logger.debug(`Sent /captcha ${code} to solve generic code CAPTCHA`);
+              logger.captcha?.(`Solved CAPTCHA by sending /captcha ${code}.`);
             } else {
               bot.chat(code);
-              logger.debug(`Sent raw code '${code}' to solve generic code CAPTCHA`);
+              logger.captcha?.(`Solved CAPTCHA by sending code ${code}.`);
             }
             authState.captchaSolved = true;
-            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig);
+            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
           } catch (err) {
             logger.warn(`Failed to send CAPTCHA response: ${err.message}`);
           }
@@ -398,7 +426,7 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
 
     // Pattern 4: simple arithmetic expressions like "3 + 5"
     if (!handled) {
-      const mathMatch = message.match(/(\d+)\s*([+\-*/])\s*(\d+)/);
+      const mathMatch = plainMessage.match(/(\d+)\s*([+\-*/])\s*(\d+)/);
       if (mathMatch) {
         const a = parseInt(mathMatch[1], 10);
         const op = mathMatch[2];
@@ -421,19 +449,19 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
           default:
             return;
         }
-        logger.debug(`Detected math CAPTCHA '${mathMatch[0]}' with answer ${result}`);
+        logger.captcha?.(`Detected math CAPTCHA "${mathMatch[0]}" with answer ${result}.`);
         const delay = randomDelay(700, 1400);
         setTimeout(() => {
           try {
-            if (/\/captcha/i.test(message)) {
+            if (/\/captcha/i.test(plainMessage)) {
               bot.chat(`/captcha ${result}`);
-              logger.debug(`Sent /captcha ${result} to solve math CAPTCHA`);
+              logger.captcha?.(`Solved CAPTCHA by sending /captcha ${result}.`);
             } else {
               bot.chat(String(result));
-              logger.debug(`Sent raw answer '${result}' to solve math CAPTCHA`);
+              logger.captcha?.(`Solved CAPTCHA by sending answer ${result}.`);
             }
             authState.captchaSolved = true;
-            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig);
+            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
           } catch (err) {
             logger.warn(`Failed to send math CAPTCHA response: ${err.message}`);
           }

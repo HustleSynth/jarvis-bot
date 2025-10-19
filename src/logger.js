@@ -3,7 +3,13 @@ const noisyPatterns = [
   /partial packet/i,
   /chunk size is \d+ but only \d+ was read/i,
 ];
-const chatMarkers = [/\[chat\]/i, /\[whisper\]/i];
+const chatMarkers = [
+  /\[chat\]/i,
+  /\[whisper\]/i,
+  /\[server\]/i,
+  /\[captcha\]/i,
+  /\[auth\]/i,
+];
 
 function shouldLog(level, threshold) {
   return levels.indexOf(level) >= levels.indexOf(threshold);
@@ -114,6 +120,16 @@ export function createLogger(level = 'info', options = {}) {
     };
   }
 
+  const createChatPrinter = (label) =>
+    showChat
+      ? (message) => {
+          const text = typeof message === 'string' ? message.trim() : String(message ?? '').trim();
+          if (text) {
+            console.log(`${label} ${text}`);
+          }
+        }
+      : () => {};
+
   logger.chat = showChat
     ? (username, message) => {
         if (message?.trim()) {
@@ -121,6 +137,10 @@ export function createLogger(level = 'info', options = {}) {
         }
       }
     : () => {};
+
+  logger.server = createChatPrinter('[server]');
+  logger.captcha = createChatPrinter('[captcha]');
+  logger.auth = createChatPrinter('[auth]');
 
   logger.child = (bindings = {}) => {
     return {
