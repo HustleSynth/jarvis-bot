@@ -6,6 +6,7 @@ An advanced Minecraft automation bot powered by [mineflayer](https://github.com/
 
 - Connects to Minecraft Java Edition servers (tested with 1.21.x, configured for 1.21.8) while imitating vanilla handshake metadata.
 - Uses `mineflayer-pathfinder` for advanced navigation, autonomous following of nearby players, and natural wandering.
+- Layers in human-like body language, casual strolls, and observation breaks so the bot reads as an actual player rather than a script.
 - Optional OpenAI integration for in-game assistance via `!ai` chat command, whispers, and ambient small talk.
 - Bootstraps /register and /login commands with human-like timing to satisfy typical cracked-server authentication.
 - Built-in commands for movement, mining, and situational awareness.
@@ -92,15 +93,19 @@ Additionally, whispering any message to the bot will yield an AI-assisted reply 
 The bot also behaves autonomously:
 
 - Upon spawn it executes the configured `/register` and `/login` commands with subtle random delays.
-- While idle it scans for nearby players, following the closest one within a configurable range.
-- When no players are nearby it wanders the area and drops occasional small-talk lines (optionally AI generated).
+- A "cognitive brain" tracks surrounding players, mobs, dropped items, and points of interest to decide what to do next.
+- It prioritizes safety (evading hostiles or retreating when damaged), opportunistically picks up nearby drops, and mines exposed ores when allowed.
+- While friendly players are nearby it follows them at human-like spacing; otherwise it explores new ground to keep moving.
+- It sprinkles in casual head turns, jumps, strafes, and short strolls between tasks so onlookers see believable player motion instead of rigid pathfinding.
+- Ambient social chatter is timed to feel natural and can optionally be AI generated for extra variety.
 
 ## Advanced Usage
 
 - Adjust `AI_SYSTEM_PROMPT` to customize the bot's personality or behavior.
 - Modify `DEFAULT_GOAL_RANGE` if the bot should stand further away from goal coordinates.
 - Disable mining or building commands by setting `ALLOW_MINING` or `ALLOW_BUILDING` to `false`.
-- Tune `AUTONOMOUS_*` variables to change scan cadence, follow distance, or wandering radius.
+- Tune `AUTONOMOUS_*` variables to change scan cadence, follow distance, maximum chase range, or wandering radius.
+- Set `ALLOW_COLLECT=false` if you don't want the bot to chase dropped items automatically.
 - Override `REGISTER_COMMAND` / `LOGIN_COMMAND` if your server uses different authentication phrases.
 
 ## Troubleshooting

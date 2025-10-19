@@ -36,6 +36,7 @@ export const aiConfig = {
 export const behaviorConfig = {
   allowMining: process.env.ALLOW_MINING !== 'false',
   allowBuilding: process.env.ALLOW_BUILDING !== 'false',
+  allowCollect: process.env.ALLOW_COLLECT !== 'false',
   defaultGoalRange: toNumber(process.env.DEFAULT_GOAL_RANGE, 1),
   humanChatDelay: {
     min: toNumber(process.env.CHAT_MIN_DELAY_MS, 800),
@@ -53,6 +54,7 @@ export const behaviorConfig = {
     enabled: process.env.AUTONOMOUS_MODE !== 'false',
     scanIntervalMs: toNumber(process.env.AUTONOMOUS_SCAN_INTERVAL_MS, 8000),
     followDistance: toNumber(process.env.AUTONOMOUS_FOLLOW_DISTANCE, 3),
+    followMaxDistance: toNumber(process.env.AUTONOMOUS_FOLLOW_MAX_DISTANCE, 18),
     wanderRadius: toNumber(process.env.AUTONOMOUS_WANDER_RADIUS, 16),
     idlePauseMs: toNumber(process.env.AUTONOMOUS_IDLE_PAUSE_MS, 15000),
     ambientChatIntervalMs: toNumber(process.env.AMBIENT_CHAT_INTERVAL_MS, 45000),
