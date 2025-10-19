@@ -11,6 +11,7 @@ const chatMarkers = [
   /\[auth\]/i,
   /\[command\]/i,
 ];
+const ansiPattern = /\u001b\[[0-9;]*[A-Za-z]/;
 
 function shouldLog(level, threshold) {
   return levels.indexOf(level) >= levels.indexOf(threshold);
@@ -62,6 +63,17 @@ function wrapConsoleMethods({ chatOnly }) {
 
   const shouldSuppress = (method, args) => {
     if (containsNoisyPattern(args)) return true;
+
+    if (method === 'log') {
+      const allowTerminalControl =
+        !args?.length ||
+        args.every((arg) => typeof arg === 'string' && arg.trim() === '') ||
+        args.some((arg) => typeof arg === 'string' && ansiPattern.test(arg));
+      if (allowTerminalControl) {
+        return false;
+      }
+    }
+
     if (!state.chatOnly) return false;
     if (method === 'log') {
       return !isChatOutput(args);

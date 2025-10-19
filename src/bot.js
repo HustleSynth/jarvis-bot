@@ -196,21 +196,28 @@ function maybeHandleAuthPrompts(bot, message, authState, behaviorConfig, logger)
 function setupCommandTerminal(bot, logger) {
   const existing = globalThis[COMMAND_TERMINAL_KEY];
   if (existing) {
-    existing.setBot(bot);
-    try {
-      existing.rl?.setPrompt?.('> ');
-      existing.rl?.prompt?.();
-    } catch (err) {
-      // ignore prompt refresh errors
+    const isClosed = existing.isClosed?.() ?? false;
+    if (!isClosed) {
+      existing.setBot(bot);
+      existing.refreshPrompt?.();
+      return existing;
     }
-    return existing;
+    delete globalThis[COMMAND_TERMINAL_KEY];
   }
 
   const state = { bot };
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const promptText = '> ';
+  let closed = false;
 
-  rl.setPrompt('> ');
-  rl.prompt();
+  const refreshPrompt = () => {
+    try {
+      rl.setPrompt(promptText);
+      rl.prompt();
+    } catch (err) {
+      // ignore prompt refresh errors
+    }
+  };
 
   const controller = {
     setBot(nextBot) {
@@ -219,19 +226,23 @@ function setupCommandTerminal(bot, logger) {
     clearBot() {
       state.bot = null;
     },
+    refreshPrompt,
+    isClosed: () => closed,
     rl,
   };
+
+  refreshPrompt();
 
   rl.on('line', (line) => {
     const cmd = line.trim();
     if (!cmd) {
-      rl.prompt();
+      refreshPrompt();
       return;
     }
     const activeBot = state.bot;
     if (!activeBot) {
       logger.command?.('No connected bot to receive manual command.');
-      rl.prompt();
+      refreshPrompt();
       return;
     }
     try {
@@ -240,12 +251,14 @@ function setupCommandTerminal(bot, logger) {
     } catch (err) {
       logger.command?.(`Failed to send manual command: ${err.message}`);
     }
-    rl.prompt();
+    refreshPrompt();
   });
 
   rl.on('close', () => {
+    closed = true;
     controller.clearBot();
     logger.command?.('Command terminal closed.');
+    delete globalThis[COMMAND_TERMINAL_KEY];
   });
 
   globalThis[COMMAND_TERMINAL_KEY] = controller;
