@@ -197,11 +197,20 @@ function setupCommandTerminal(bot, logger) {
   const existing = globalThis[COMMAND_TERMINAL_KEY];
   if (existing) {
     existing.setBot(bot);
+    try {
+      existing.rl?.setPrompt?.('> ');
+      existing.rl?.prompt?.();
+    } catch (err) {
+      // ignore prompt refresh errors
+    }
     return existing;
   }
 
   const state = { bot };
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  rl.setPrompt('> ');
+  rl.prompt();
 
   const controller = {
     setBot(nextBot) {
@@ -215,22 +224,28 @@ function setupCommandTerminal(bot, logger) {
 
   rl.on('line', (line) => {
     const cmd = line.trim();
-    if (!cmd) return;
+    if (!cmd) {
+      rl.prompt();
+      return;
+    }
     const activeBot = state.bot;
     if (!activeBot) {
-      logger.server?.('No connected bot to receive manual command.');
+      logger.command?.('No connected bot to receive manual command.');
+      rl.prompt();
       return;
     }
     try {
       activeBot.chat(cmd);
+      logger.command?.(`Sent manual command: ${cmd}`);
     } catch (err) {
-      logger.server?.(`Failed to send manual command: ${err.message}`);
+      logger.command?.(`Failed to send manual command: ${err.message}`);
     }
+    rl.prompt();
   });
 
   rl.on('close', () => {
     controller.clearBot();
-    logger.server?.('Command terminal closed.');
+    logger.command?.('Command terminal closed.');
   });
 
   globalThis[COMMAND_TERMINAL_KEY] = controller;

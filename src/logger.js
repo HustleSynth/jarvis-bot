@@ -9,6 +9,7 @@ const chatMarkers = [
   /\[server\]/i,
   /\[captcha\]/i,
   /\[auth\]/i,
+  /\[command\]/i,
 ];
 
 function shouldLog(level, threshold) {
@@ -141,6 +142,7 @@ export function createLogger(level = 'info', options = {}) {
   logger.server = createChatPrinter('[server]');
   logger.captcha = createChatPrinter('[captcha]');
   logger.auth = createChatPrinter('[auth]');
+  logger.command = createChatPrinter('[command]');
 
   logger.child = (bindings = {}) => {
     return {
