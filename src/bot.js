@@ -167,29 +167,6 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
     viewDistance: botConfig.viewDistance,
   });
 
-  // Suppress noisy partial packet warnings from underlying libraries. Some
-  // versions of minecraft-protocol/protodef emit warnings via
-  // console.warn when they encounter unknown or truncated packets (e.g.,
-  // "Chunk size is 330 but only 222 was read ; partial packet"). These
-  // warnings are harmless and clutter the console. Override console.warn
-  // to ignore messages containing "partial packet" or "Chunk size is".
-  if (!console.__jarvisWarnFiltered) {
-    const originalConsoleWarn = console.warn;
-    console.warn = (...args) => {
-      try {
-        const first = args[0];
-        if (typeof first === 'string' && (first.includes('partial packet') || first.includes('Chunk size is'))) {
-          // Ignore these noisy protocol warnings
-          return;
-        }
-      } catch (e) {
-        // ignore errors in filtering
-      }
-      originalConsoleWarn.apply(console, args);
-    };
-    console.__jarvisWarnFiltered = originalConsoleWarn;
-  }
-
   // ✅ Load the plugins using the fixed import
   bot.loadPlugin(pathfinder);
   bot.loadPlugin(collectBlockPlugin);
