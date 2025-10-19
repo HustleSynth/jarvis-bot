@@ -1,7 +1,10 @@
 import mineflayer from 'mineflayer';
-import { pathfinder } from 'mineflayer-pathfinder';
-import { plugin as collectBlockPlugin } from 'mineflayer-collectblock';
 
+// ✅ Correct import for CommonJS module
+import mineflayerPathfinder from 'mineflayer-pathfinder';
+const { pathfinder } = mineflayerPathfinder;
+
+import { plugin as collectBlockPlugin } from 'mineflayer-collectblock';
 import { registerCommands } from './commands.js';
 import { enableAutonomousBrain } from './autonomy.js';
 
@@ -69,6 +72,7 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
     viewDistance: botConfig.viewDistance,
   });
 
+  // ✅ Load the plugins using the fixed import
   bot.loadPlugin(pathfinder);
   bot.loadPlugin(collectBlockPlugin);
 
