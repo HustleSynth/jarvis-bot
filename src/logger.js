@@ -105,6 +105,9 @@ export function createLogger(level = 'info', options = {}) {
     }
 
     logger[lvl] = (...args) => {
+      if (chatOnly && (lvl === 'trace' || lvl === 'debug' || lvl === 'info')) {
+        return;
+      }
       if (!shouldLog(lvl, threshold)) return;
       const method = lvl === 'error' ? 'error' : lvl === 'warn' ? 'warn' : lvl === 'debug' ? 'debug' : 'log';
       const [first, ...rest] = args;
