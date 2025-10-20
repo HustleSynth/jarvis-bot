@@ -61,6 +61,12 @@ export const behaviorConfig = {
     wanderRadius: toNumber(process.env.AUTONOMOUS_WANDER_RADIUS, 16),
     idlePauseMs: toNumber(process.env.AUTONOMOUS_IDLE_PAUSE_MS, 15000),
     ambientChatIntervalMs: toNumber(process.env.AMBIENT_CHAT_INTERVAL_MS, 45000),
+    remoteSeekEnabled: process.env.AUTONOMOUS_REMOTE_SEEK_ENABLED !== 'false',
+    remoteSeekMinRadius: toNumber(process.env.AUTONOMOUS_REMOTE_SEEK_MIN_RADIUS, 48),
+    remoteSeekMaxRadius: toNumber(process.env.AUTONOMOUS_REMOTE_SEEK_MAX_RADIUS, 96),
+    remoteSeekCooldownMs: toNumber(process.env.AUTONOMOUS_REMOTE_SEEK_COOLDOWN_MS, 45000),
+    remotePlayerForgetMs: toNumber(process.env.AUTONOMOUS_REMOTE_FORGET_MS, 240000),
+    remoteHintForgetMs: toNumber(process.env.AUTONOMOUS_REMOTE_HINT_FORGET_MS, 180000),
   },
 };
 

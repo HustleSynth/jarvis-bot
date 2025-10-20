@@ -10,6 +10,7 @@ const chatMarkers = [
   /\[captcha\]/i,
   /\[auth\]/i,
   /\[command\]/i,
+  /\[intel\]/i,
 ];
 const ansiPattern = /\u001b\[[0-9;]*[A-Za-z]/;
 
@@ -179,6 +180,7 @@ export function createLogger(level = 'info', options = {}) {
   logger.captcha = createChatPrinter('[captcha]');
   logger.auth = createChatPrinter('[auth]');
   logger.command = createChatPrinter('[command]');
+  logger.intel = createChatPrinter('[intel]');
 
   logger.child = (bindings = {}) => {
     return {

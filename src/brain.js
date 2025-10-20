@@ -104,6 +104,7 @@ const TaskType = Object.freeze({
   STROLL: 'stroll',
   COMBAT: 'combat',
   GROUP_FOLLOW: 'group_follow',
+  SEEK_REMOTE_PLAYER: 'seek_remote_player',
 });
 
 function cloneVec(vec) {
@@ -127,6 +128,64 @@ function randomChoice(list) {
 
 function randomBetween(min, max) {
   return min + Math.random() * (max - min);
+}
+
+function hashStringToAngle(text) {
+  if (!text) return Math.random() * Math.PI * 2;
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+  }
+  return ((hash % 360) * Math.PI) / 180;
+}
+
+function sanitizeChatText(message) {
+  if (typeof message !== 'string') return '';
+  return message.replace(/§[0-9a-fklmnor]/gi, ' ');
+}
+
+function createCoordinateVec(x, y, z) {
+  if (![x, y, z].every((value) => Number.isFinite(value))) return null;
+  if (Math.abs(x) > 30_000_000 || Math.abs(z) > 30_000_000) return null;
+  if (y < -128 || y > 512) return null;
+  if (Math.abs(x) < 6 && Math.abs(z) < 6) return null;
+  return new Vec3(Math.round(x), Math.round(y), Math.round(z));
+}
+
+function parseCoordinateHint(message, fallbackY = 64) {
+  if (!message || typeof message !== 'string') return null;
+  const sanitized = sanitizeChatText(message);
+  const fallback = Number.isFinite(fallbackY) ? fallbackY : 64;
+
+  const labelledFull = sanitized.match(/x\s*[:=]\s*(-?\d{1,5})[\s,;]+y\s*[:=]\s*(-?\d{1,5})[\s,;]+z\s*[:=]\s*(-?\d{1,5})/i);
+  if (labelledFull) {
+    const x = Number.parseInt(labelledFull[1], 10);
+    const y = Number.parseInt(labelledFull[2], 10);
+    const z = Number.parseInt(labelledFull[3], 10);
+    const vec = createCoordinateVec(x, y, z);
+    if (vec) return vec;
+  }
+
+  const labelledXZ = sanitized.match(/x\s*[:=]\s*(-?\d{1,5})[\s,;]+z\s*[:=]\s*(-?\d{1,5})/i);
+  if (labelledXZ) {
+    const x = Number.parseInt(labelledXZ[1], 10);
+    const z = Number.parseInt(labelledXZ[2], 10);
+    const vec = createCoordinateVec(x, fallback, z);
+    if (vec) return vec;
+  }
+
+  const numericTripleRegex = /(-?\d{2,5})[\s,;]+(-?\d{2,5})[\s,;]+(-?\d{2,5})/g;
+  let match = numericTripleRegex.exec(sanitized);
+  while (match) {
+    const x = Number.parseInt(match[1], 10);
+    const y = Number.parseInt(match[2], 10);
+    const z = Number.parseInt(match[3], 10);
+    const vec = createCoordinateVec(x, y, z);
+    if (vec) return vec;
+    match = numericTripleRegex.exec(sanitized);
+  }
+
+  return null;
 }
 
 function addNoiseToPosition(position, radius) {
@@ -201,6 +260,9 @@ function equipForCombat(bot, logger) {
 
 function createDefaultBrainConfig(behaviorConfig) {
   const settings = behaviorConfig?.autonomous || {};
+  const baseWanderRadius = settings.wanderRadius || 32;
+  const remoteSeekMin = settings.remoteSeekMinRadius || Math.max(24, baseWanderRadius * 1.5);
+  const remoteSeekMax = settings.remoteSeekMaxRadius || Math.max(remoteSeekMin + 16, baseWanderRadius * 2.5);
   return {
     decisionIntervalMs: Math.max(2000, settings.scanIntervalMs || 6000),
     observationIntervalMs: 2000,
@@ -239,6 +301,12 @@ function createDefaultBrainConfig(behaviorConfig) {
     groupFollowRadius: settings.groupFollowRadius || 12,
     groupFollowLeash: settings.groupFollowLeash || 20,
     groupMinSize: settings.groupMinSize || 2,
+    remoteSeekEnabled: settings.remoteSeekEnabled !== false,
+    remoteSeekMinRadius: remoteSeekMin,
+    remoteSeekMaxRadius: remoteSeekMax,
+    remoteSeekCooldownMs: settings.remoteSeekCooldownMs || 45_000,
+    remotePlayerForgetMs: settings.remotePlayerForgetMs || 240_000,
+    remoteHintForgetMs: settings.remoteHintForgetMs || 180_000,
   };
 }
 
@@ -262,6 +330,7 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
       items: new Map(),
       pois: [],
       resourceTargets: [],
+      remotePlayers: new Map(),
     },
     managedTimeouts: new Set(),
     combatCooldownUntil: 0,
@@ -366,6 +435,56 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     });
   }
 
+  function rememberRemotePlayer(username, updates = {}) {
+    if (!username || username === bot.username) return null;
+    const prev = state.memory.remotePlayers.get(username) || {};
+    const hintProvided = Object.prototype.hasOwnProperty.call(updates, 'hintPosition');
+    const seekTargetProvided = Object.prototype.hasOwnProperty.call(updates, 'lastSeekTarget');
+    const entry = {
+      username,
+      ping: updates.ping ?? prev.ping ?? null,
+      gamemode: updates.gamemode ?? prev.gamemode ?? null,
+      listed: Object.prototype.hasOwnProperty.call(updates, 'listed')
+        ? updates.listed
+        : prev.listed ?? true,
+      lastUpdate: Date.now(),
+      lastHeardAt: updates.lastHeardAt ?? prev.lastHeardAt ?? 0,
+      lastMessage: updates.lastMessage ?? prev.lastMessage ?? null,
+      hintPosition: prev.hintPosition ? cloneVec(prev.hintPosition) : null,
+      hintSource: prev.hintSource ?? null,
+      lastHintAt: prev.lastHintAt ?? 0,
+      lastSeekAt: updates.lastSeekAt ?? prev.lastSeekAt ?? 0,
+      lastSeekCompletedAt: updates.lastSeekCompletedAt ?? prev.lastSeekCompletedAt ?? 0,
+      lastSeekTarget: seekTargetProvided
+        ? updates.lastSeekTarget
+          ? cloneVec(updates.lastSeekTarget)
+          : null
+        : prev.lastSeekTarget
+        ? cloneVec(prev.lastSeekTarget)
+        : null,
+      lastSeekStartedAt: updates.lastSeekStartedAt ?? prev.lastSeekStartedAt ?? 0,
+    };
+
+    if (hintProvided) {
+      entry.hintPosition = updates.hintPosition ? cloneVec(updates.hintPosition) : null;
+      entry.hintSource = updates.hintSource ?? (entry.hintPosition ? 'hint' : null);
+      entry.lastHintAt = updates.lastHintAt ?? (entry.hintPosition ? Date.now() : entry.lastHintAt);
+    }
+
+    state.memory.remotePlayers.set(username, entry);
+    return entry;
+  }
+
+  function forgetRemotePlayer(username) {
+    if (!username) return;
+    state.memory.remotePlayers.delete(username);
+  }
+
+  function remotePlayerEntries() {
+    if (state.memory.remotePlayers.size === 0) return [];
+    return Array.from(state.memory.remotePlayers.values());
+  }
+
   function rememberResourceTarget(block, kind, priority = 1) {
     if (!block?.position) return;
     const position = cloneVec(block.position);
@@ -446,6 +565,26 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
         state.memory.items.delete(id);
       }
     }
+    if (!brainConfig.remoteSeekEnabled) {
+      state.memory.remotePlayers.clear();
+    }
+    for (const [username, info] of state.memory.remotePlayers) {
+      if (!info) {
+        state.memory.remotePlayers.delete(username);
+        continue;
+      }
+      const lastUpdate = info.lastUpdate ?? 0;
+      if (now - lastUpdate > brainConfig.remotePlayerForgetMs || info.listed === false) {
+        state.memory.remotePlayers.delete(username);
+        continue;
+      }
+      if (
+        info.hintPosition &&
+        now - (info.lastHintAt ?? lastUpdate) > brainConfig.remoteHintForgetMs
+      ) {
+        rememberRemotePlayer(username, { hintPosition: null, hintSource: null });
+      }
+    }
     state.memory.resourceTargets = state.memory.resourceTargets.filter((entry) => {
       if (!entry) return false;
       if (now - entry.notedAt > brainConfig.resourceForgetMs) return false;
@@ -467,7 +606,16 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
 
     Object.entries(bot.players || {}).forEach(([username, player]) => {
       if (username === bot.username) return;
-      if (player?.entity) rememberPlayer(username, player.entity);
+      if (player?.entity?.position) {
+        rememberPlayer(username, player.entity);
+        forgetRemotePlayer(username);
+      } else if (player && brainConfig.remoteSeekEnabled) {
+        rememberRemotePlayer(username, {
+          ping: player.ping,
+          gamemode: player.gamemode,
+          listed: player.listed,
+        });
+      }
     });
 
     Object.values(bot.entities || {}).forEach((entity) => {
@@ -573,6 +721,43 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
       }
     }
     return nearest;
+  }
+
+  function remotePlayerCandidates() {
+    if (!brainConfig.remoteSeekEnabled) return [];
+    const now = Date.now();
+    return remotePlayerEntries().filter((info) => {
+      if (!info || !info.username) return false;
+      if (info.listed === false) return false;
+      const lastUpdate = info.lastUpdate ?? 0;
+      if (now - lastUpdate > brainConfig.remotePlayerForgetMs) return false;
+      return true;
+    });
+  }
+
+  function selectRemotePlayerTarget() {
+    const candidates = remotePlayerCandidates();
+    if (!candidates.length) return null;
+    const now = Date.now();
+    const hintScore = (entry) => (entry?.hintPosition ? 1 : 0);
+    candidates.sort((a, b) => {
+      const hintDelta = hintScore(b) - hintScore(a);
+      if (hintDelta !== 0) return hintDelta;
+      const heardDelta = (b.lastHeardAt ?? 0) - (a.lastHeardAt ?? 0);
+      if (heardDelta !== 0) return heardDelta;
+      const updateDelta = (b.lastUpdate ?? 0) - (a.lastUpdate ?? 0);
+      if (updateDelta !== 0) return updateDelta;
+      return (a.lastSeekAt ?? 0) - (b.lastSeekAt ?? 0);
+    });
+
+    for (const info of candidates) {
+      if (info.hintPosition) return info;
+      const seekCooldown = info.lastSeekAt ?? 0;
+      if (now - seekCooldown > brainConfig.remoteSeekCooldownMs) {
+        return info;
+      }
+    }
+    return null;
   }
 
   function computePlayerGroups() {
@@ -916,6 +1101,93 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
         bot.pathfinder?.setMovements(movements);
         bot.pathfinder?.setGoal(goal);
         logger.debug(`Exploring towards ${target.x}, ${target.y}, ${target.z}`);
+      },
+    };
+  }
+
+  function computeRemoteSearchTarget(remoteInfo) {
+    if (!brainConfig.remoteSeekEnabled) return null;
+    if (remoteInfo?.hintPosition) {
+      return cloneVec(remoteInfo.hintPosition);
+    }
+    const botPosition = bot.entity?.position;
+    if (!botPosition) return null;
+    const minRadius = Math.max(16, brainConfig.remoteSeekMinRadius || brainConfig.wanderRadius * 2);
+    const maxRadius = Math.max(minRadius + 16, brainConfig.remoteSeekMaxRadius || minRadius + 32);
+    const baseAngle = hashStringToAngle(remoteInfo?.username || '') + (Math.random() - 0.5) * (Math.PI / 4);
+    const radius = randomBetween(minRadius, maxRadius);
+    const x = botPosition.x + Math.cos(baseAngle) * radius;
+    const z = botPosition.z + Math.sin(baseAngle) * radius;
+    const y = botPosition.y;
+    return new Vec3(Math.round(x), Math.round(y), Math.round(z));
+  }
+
+  function seekRemotePlayerTask(remoteInfo) {
+    if (!brainConfig.remoteSeekEnabled) return null;
+    if (!remoteInfo || !remoteInfo.username) return null;
+    const botPosition = bot.entity?.position;
+    if (!botPosition) return null;
+
+    const usingHint = Boolean(remoteInfo.hintPosition);
+    const target = computeRemoteSearchTarget(remoteInfo);
+    if (!target) return null;
+
+    const range = Math.max(brainConfig.followDistance + 4, 6);
+    const goal = new Goals.GoalNear(target.x, target.y, target.z, range);
+
+    return {
+      type: TaskType.SEEK_REMOTE_PLAYER,
+      target: { username: remoteInfo.username, position: target, usingHint },
+      startedAt: Date.now(),
+      cleanup: () => {
+        if (bot.pathfinder?.goal === goal) {
+          bot.pathfinder.setGoal(null);
+        }
+        clearControls();
+        if (!brainConfig.remoteSeekEnabled) return;
+        const remote = state.memory.remotePlayers.get(remoteInfo.username);
+        if (remote) {
+          rememberRemotePlayer(remoteInfo.username, {
+            lastSeekCompletedAt: Date.now(),
+            lastSeekTarget: null,
+            lastSeekStartedAt: 0,
+          });
+          if (usingHint) {
+            const botPos = bot.entity?.position;
+            if (botPos && distanceSquared(botPos, target) <= (range + 4) * (range + 4)) {
+              rememberRemotePlayer(remoteInfo.username, { hintPosition: null, hintSource: null });
+            }
+          }
+        }
+      },
+      continuePredicate: () => {
+        if (!brainConfig.remoteSeekEnabled) return false;
+        if (bot.pathfinder?.goal !== goal) return false;
+        const botPos = bot.entity?.position;
+        if (!botPos) return false;
+        if (distanceSquared(botPos, target) <= range * range) return false;
+        const remote = state.memory.remotePlayers.get(remoteInfo.username);
+        if (!remote) return false;
+        if (usingHint && remote.hintPosition && distanceSquared(remote.hintPosition, target) > 36) {
+          return false;
+        }
+        return true;
+      },
+      engage: () => {
+        bot.pathfinder?.setMovements(movements);
+        bot.pathfinder?.setGoal(goal);
+        if (brainConfig.remoteSeekEnabled) {
+          rememberRemotePlayer(remoteInfo.username, {
+            lastSeekAt: Date.now(),
+            lastSeekStartedAt: Date.now(),
+            lastSeekTarget: target,
+          });
+        }
+        if (usingHint) {
+          logger.intel?.(`Investigating ${remoteInfo.username}'s hint near ${target.x}, ${target.y}, ${target.z}.`);
+        } else {
+          logger.intel?.(`Scanning outward for ${remoteInfo.username} around ${target.x}, ${target.y}, ${target.z}.`);
+        }
       },
     };
   }
@@ -1368,6 +1640,16 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
       }
     }
 
+    if (!nearestPlayer && brainConfig.remoteSeekEnabled) {
+      const remoteTarget = selectRemotePlayerTarget();
+      if (remoteTarget) {
+        const seekTask = seekRemotePlayerTask(remoteTarget);
+        if (seekTask) {
+          return seekTask;
+        }
+      }
+    }
+
     if (shouldTakeObservationBreak(now, nearestPlayer)) {
       const observation = observeTask();
       if (observation) {
@@ -1525,10 +1807,71 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     }
   });
 
+  bot.on('playerJoined', (player) => {
+    if (!player?.username || player.username === bot.username) return;
+    if (brainConfig.remoteSeekEnabled) {
+      rememberRemotePlayer(player.username, {
+        ping: player.ping,
+        gamemode: player.gamemode,
+        listed: player.listed,
+      });
+      logger.intel?.(`${player.username} joined. Tracking as distant contact.`);
+    }
+  });
+
+  bot.on('playerUpdated', (player) => {
+    if (!player?.username || player.username === bot.username) return;
+    if (player.entity?.position) {
+      rememberPlayer(player.username, player.entity);
+      forgetRemotePlayer(player.username);
+    } else if (brainConfig.remoteSeekEnabled) {
+      rememberRemotePlayer(player.username, {
+        ping: player.ping,
+        gamemode: player.gamemode,
+        listed: player.listed,
+      });
+    }
+  });
+
+  bot.on('playerLeft', (player) => {
+    if (!player?.username || player.username === bot.username) return;
+    state.memory.players.delete(player.username);
+    forgetRemotePlayer(player.username);
+  });
+
   bot.on('chat', (username, message) => {
     if (username === bot.username) return;
     if (!message) return;
-    if (message.toLowerCase().includes('come here') || message.toLowerCase().includes('follow')) {
+    const normalized = message.trim();
+
+    if (brainConfig.remoteSeekEnabled) {
+      const prior = state.memory.remotePlayers.get(username);
+      const fallbackY = bot.entity?.position?.y ?? 64;
+      const hint = parseCoordinateHint(normalized, fallbackY);
+      const updates = {
+        lastHeardAt: Date.now(),
+        lastMessage: normalized,
+      };
+      if (hint) {
+        updates.hintPosition = hint;
+        updates.hintSource = 'chat';
+        updates.lastHintAt = Date.now();
+      }
+      const entry = rememberRemotePlayer(username, updates);
+      if (hint) {
+        const priorHint = prior?.hintPosition;
+        const changed = !priorHint || distanceSquared(priorHint, hint) > 16;
+        if (changed) {
+          markPointOfInterest(hint, `${username} hint`);
+          logger.intel?.(`${username} mentioned ${hint.x}, ${hint.y}, ${hint.z}. Scheduling recon.`);
+        }
+      } else if (!prior && entry) {
+        logger.intel?.(`${username} spoke up. Added to distant watch list.`);
+      }
+    }
+
+    const lower = normalized.toLowerCase();
+    if (lower.includes('come here') || lower.includes('follow')) {
       const info = state.memory.players.get(username);
       if (info) {
         state.memory.pois.unshift({ position: cloneVec(info.position), description: 'chat request', notedAt: Date.now() });
