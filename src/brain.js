@@ -307,6 +307,8 @@ function createDefaultBrainConfig(behaviorConfig) {
     remoteSeekCooldownMs: settings.remoteSeekCooldownMs || 45_000,
     remotePlayerForgetMs: settings.remotePlayerForgetMs || 240_000,
     remoteHintForgetMs: settings.remoteHintForgetMs || 180_000,
+    deathRecoveryPauseMs: settings.deathRecoveryPauseMs || 5000,
+    deathEquipDelayMs: settings.deathEquipDelayMs || 1200,
   };
 }
 
@@ -333,6 +335,7 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
       remotePlayers: new Map(),
     },
     managedTimeouts: new Set(),
+    managedTimeoutBuckets: new Map(),
     combatCooldownUntil: 0,
     lastCombatTime: 0,
   };
@@ -343,11 +346,15 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
       if (bucket && bucket !== state.managedTimeouts) {
         bucket.delete(timer);
       }
+      state.managedTimeoutBuckets.delete(timer);
       callback();
     }, delay);
     state.managedTimeouts.add(timer);
     if (bucket && bucket !== state.managedTimeouts) {
       bucket.add(timer);
+      state.managedTimeoutBuckets.set(timer, bucket);
+    } else {
+      state.managedTimeoutBuckets.set(timer, null);
     }
     return timer;
   }
@@ -356,8 +363,20 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     if (!timer) return;
     clearTimeout(timer);
     state.managedTimeouts.delete(timer);
+    const otherBucket = state.managedTimeoutBuckets.get(timer);
+    if (otherBucket && otherBucket !== bucket) {
+      otherBucket.delete(timer);
+    }
+    state.managedTimeoutBuckets.delete(timer);
     if (bucket && bucket !== state.managedTimeouts) {
       bucket.delete(timer);
+    }
+  }
+
+  function clearAllManagedTimeouts() {
+    if (state.managedTimeouts.size === 0) return;
+    for (const timer of Array.from(state.managedTimeouts)) {
+      clearManagedTimeout(timer);
     }
   }
 
@@ -395,6 +414,13 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
         state.currentTask.cleanup();
       } catch (error) {
         logger.debug(`Task cleanup failed: ${error.message}`);
+      }
+    }
+    if (state.asyncTask?.cancel) {
+      try {
+        state.asyncTask.cancel();
+      } catch (error) {
+        logger.debug(`Async task cancel failed: ${error.message}`);
       }
     }
     if (bot.pathfinder) {
@@ -478,6 +504,20 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
   function forgetRemotePlayer(username) {
     if (!username) return;
     state.memory.remotePlayers.delete(username);
+  }
+
+  function resetAfterDeath() {
+    cancelCurrentTask('death');
+    clearAllManagedTimeouts();
+    state.managedTimeoutBuckets.clear();
+    clearControls();
+    state.memory.hostiles.clear();
+    state.memory.items.clear();
+    state.memory.resourceTargets = [];
+    state.lastDamageTime = Date.now();
+    state.combatCooldownUntil = Date.now() + brainConfig.combatCooldownMs;
+    state.lastPlanRun = Date.now();
+    state.pausedUntil = Date.now() + brainConfig.deathRecoveryPauseMs;
   }
 
   function remotePlayerEntries() {
@@ -1839,6 +1879,22 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     forgetRemotePlayer(player.username);
   });
 
+  bot.on('death', () => {
+    logger.warn('Bot died. Resetting state and awaiting respawn.');
+    logger.server?.('Bot died. Recovering automatically...');
+    resetAfterDeath();
+  });
+
+  bot.on('respawn', () => {
+    logger.info('Respawned safely; resuming autonomy.');
+    state.pausedUntil = Date.now() + brainConfig.deathRecoveryPauseMs;
+    state.lastDamageTime = 0;
+    state.lastCombatTime = 0;
+    registerTimeout(() => {
+      equipForCombat(bot, logger);
+    }, brainConfig.deathEquipDelayMs);
+  });
+
   bot.on('chat', (username, message) => {
     if (username === bot.username) return;
     if (!message) return;
@@ -1889,10 +1945,8 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     clearInterval(planningTimer);
     clearInterval(socialTimer);
     clearInterval(gestureTimer);
-    for (const timer of state.managedTimeouts) {
-      clearTimeout(timer);
-    }
-    state.managedTimeouts.clear();
+    clearAllManagedTimeouts();
+    state.managedTimeoutBuckets.clear();
   });
 
   return {

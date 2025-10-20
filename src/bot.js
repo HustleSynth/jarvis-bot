@@ -595,6 +595,20 @@ export function createBot(
     }
   });
 
+  bot.on('death', () => {
+    logger.warn('Bot died. Awaiting respawn...');
+    logger.server?.('Bot died. Awaiting respawn...');
+    terminalController?.refreshPrompt?.();
+    autonomy?.pause?.(behaviorConfig?.autonomous?.idlePauseMs ?? 15000);
+  });
+
+  bot.on('respawn', () => {
+    logger.info('Respawned after death.');
+    logger.server?.('Respawned after death.');
+    terminalController?.setBot?.(bot);
+    terminalController?.refreshPrompt?.();
+  });
+
   /**
    * CAPTCHA detection and solving
    *
