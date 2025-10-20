@@ -37,6 +37,8 @@ export const behaviorConfig = {
   allowMining: process.env.ALLOW_MINING !== 'false',
   allowBuilding: process.env.ALLOW_BUILDING !== 'false',
   allowCollect: process.env.ALLOW_COLLECT !== 'false',
+  allowCombat: process.env.ALLOW_COMBAT !== 'false',
+  allowWoodHarvest: process.env.ALLOW_WOOD_HARVEST !== 'false',
   defaultGoalRange: toNumber(process.env.DEFAULT_GOAL_RANGE, 1),
   humanChatDelay: {
     min: toNumber(process.env.CHAT_MIN_DELAY_MS, 800),
