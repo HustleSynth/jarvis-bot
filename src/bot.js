@@ -9,6 +9,110 @@ import { plugin as collectBlockPlugin } from 'mineflayer-collectblock';
 import { registerCommands } from './commands.js';
 import { enableAutonomousBrain } from './autonomy.js';
 
+const COMMAND_TERMINAL_KEY = Symbol.for('jarvis.commandTerminal');
+
+function createPromptScheduler(rl, outputStream, logger) {
+  const stream = outputStream && typeof outputStream.once === 'function' ? outputStream : process.stdout;
+  let closed = false;
+  let pendingTimeout = null;
+  let waitingForDrain = false;
+  let drainTarget = null;
+  let drainListener = null;
+  let lastRefresh = Date.now();
+
+  function runPrompt() {
+    if (closed) return;
+    try {
+      rl.resume?.();
+      rl.prompt(true);
+      lastRefresh = Date.now();
+    } catch (err) {
+      logger?.command?.(`Prompt refresh failed: ${err?.message ?? err}`);
+    }
+  }
+
+  function detachDrainListener() {
+    if (!waitingForDrain) return;
+    waitingForDrain = false;
+    const target = drainTarget;
+    drainTarget = null;
+    if (!target || !drainListener) {
+      drainListener = null;
+      return;
+    }
+    if (typeof target.off === 'function') {
+      target.off('drain', drainListener);
+    } else if (typeof target.removeListener === 'function') {
+      target.removeListener('drain', drainListener);
+    }
+    drainListener = null;
+  }
+
+  function schedule() {
+    if (closed) return;
+    if (pendingTimeout || waitingForDrain) return;
+
+    const target = stream && typeof stream.once === 'function' ? stream : process.stdout;
+
+    if (target?.writableNeedDrain) {
+      waitingForDrain = true;
+      drainTarget = target;
+      drainListener = () => {
+        detachDrainListener();
+        if (closed) return;
+        pendingTimeout = setTimeout(() => {
+          pendingTimeout = null;
+          runPrompt();
+        }, 0);
+      };
+      target.once('drain', drainListener);
+      return;
+    }
+
+    pendingTimeout = setTimeout(() => {
+      pendingTimeout = null;
+      runPrompt();
+    }, 0);
+  }
+
+  function cancel() {
+    if (pendingTimeout) {
+      clearTimeout(pendingTimeout);
+      pendingTimeout = null;
+    }
+    detachDrainListener();
+  }
+
+  function flush() {
+    cancel();
+    runPrompt();
+  }
+
+  const keepAliveIntervalMs = 15000;
+  const keepAliveTimer = setInterval(() => {
+    if (closed) {
+      clearInterval(keepAliveTimer);
+      return;
+    }
+    if (Date.now() - lastRefresh >= keepAliveIntervalMs) {
+      schedule();
+    }
+  }, Math.max(keepAliveIntervalMs / 3, 2000));
+
+  function stop() {
+    closed = true;
+    cancel();
+    clearInterval(keepAliveTimer);
+  }
+
+  return {
+    schedule,
+    cancel,
+    flush,
+    stop,
+  };
+}
+
 function randomDelay(min, max) {
   const low = Math.min(min, max);
   const high = Math.max(min, max);
@@ -62,6 +166,46 @@ function queueHumanLikeChat(bot, message, behaviorConfig) {
   }, delay);
 }
 
+function stripMinecraftFormatting(message) {
+  if (typeof message !== 'string') {
+    if (message === null || message === undefined) return '';
+    return String(message).trim();
+  }
+  return message.replace(/§[0-9a-fklmnor]/gi, '').trim();
+}
+
+function collapseChatComponent(component) {
+  if (component === null || component === undefined) return '';
+  if (typeof component === 'string') return component;
+  if (Buffer.isBuffer(component)) {
+    return component.toString('utf8');
+  }
+  if (Array.isArray(component)) {
+    return component.map((part) => collapseChatComponent(part)).join('');
+  }
+  if (typeof component === 'object') {
+    const text = component.text ? String(component.text) : '';
+    const extra = Array.isArray(component.extra)
+      ? component.extra.map((part) => collapseChatComponent(part)).join('')
+      : '';
+    if (text || extra) {
+      return text + extra;
+    }
+    try {
+      return JSON.stringify(component);
+    } catch (err) {
+      return String(component);
+    }
+  }
+  return String(component);
+}
+
+function formatDisconnectReason(reason) {
+  const raw = collapseChatComponent(reason);
+  const cleaned = stripMinecraftFormatting(raw);
+  return cleaned || 'Unknown';
+}
+
 /**
  * Send registration and login commands after CAPTCHA is solved.
  * Many servers require the player to register and/or log in using
@@ -71,24 +215,78 @@ function queueHumanLikeChat(bot, message, behaviorConfig) {
  * respects the `authState` flags to avoid sending duplicates. Commands
  * are sent with a random human‑like delay using `queueHumanLikeChat`.
  */
-function sendAuthCommandsIfNeeded(bot, authState, behaviorConfig) {
+function sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger) {
   if (!behaviorConfig?.auth) return;
   const { auth } = behaviorConfig;
-  // After captcha is solved, send register/login commands as needed
+  const captchaRequired = auth.requireCaptcha === true;
+  if (captchaRequired && !authState.captchaSolved) return;
+
   if (auth.autoRegister && auth.registerCommand && !authState.registerSent) {
     authState.registerSent = true;
+    authState.registerSentAt = Date.now();
     const delay = randomDelay(1500, 3000);
     setTimeout(() => {
       queueHumanLikeChat(bot, auth.registerCommand, behaviorConfig);
+      logger?.auth?.('Sent automatic register command.');
     }, delay);
   }
+
   if (auth.autoLogin && auth.loginCommand && !authState.loginSent) {
     authState.loginSent = true;
+    authState.loginSentAt = Date.now();
     const delay = randomDelay(2500, 4000);
     setTimeout(() => {
       queueHumanLikeChat(bot, auth.loginCommand, behaviorConfig);
+      logger?.auth?.('Sent automatic login command.');
     }, delay);
   }
+}
+
+function maybeHandleAuthPrompts(bot, message, authState, behaviorConfig, logger) {
+  if (!behaviorConfig?.auth?.enabled) return;
+  const { auth } = behaviorConfig;
+  const lower = message.toLowerCase();
+
+  const registerPrompt =
+    auth.autoRegister &&
+    auth.registerCommand &&
+    (lower.includes('/register') ||
+      (lower.includes('register') && (lower.includes('please') || lower.includes('use') || lower.includes('type'))));
+
+  const loginPrompt =
+    auth.autoLogin &&
+    auth.loginCommand &&
+    (lower.includes('/login') ||
+      lower.includes('please login') ||
+      lower.includes('login with') ||
+      lower.includes('login to') ||
+      lower.includes('login using'));
+
+  if (!registerPrompt && !loginPrompt) return;
+
+  if (auth.requireCaptcha !== true) {
+    authState.captchaSolved = true;
+  }
+
+  const now = Date.now();
+  if (registerPrompt && authState.registerSent && now - (authState.registerSentAt ?? 0) > 8000) {
+    authState.registerSent = false;
+  }
+  if (loginPrompt && authState.loginSent && now - (authState.loginSentAt ?? 0) > 8000) {
+    authState.loginSent = false;
+  }
+
+  if (registerPrompt || loginPrompt) {
+    logger?.auth?.(
+      registerPrompt && loginPrompt
+        ? 'Server requested both register and login. Ensuring commands are queued.'
+        : registerPrompt
+          ? 'Server requested registration. Ensuring register command is queued.'
+          : 'Server requested login. Ensuring login command is queued.'
+    );
+  }
+
+  sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
 }
 
 /**
@@ -98,23 +296,141 @@ function sendAuthCommandsIfNeeded(bot, authState, behaviorConfig) {
  * commands (e.g. "/home" or "say hello"), simply type them and hit enter.
  */
 function setupCommandTerminal(bot, logger) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const existing = globalThis[COMMAND_TERMINAL_KEY];
+  if (existing) {
+    const isClosed = existing.isClosed?.() ?? false;
+    if (!isClosed) {
+      existing.setBot(bot);
+      existing.refreshPrompt?.();
+      return existing;
+    }
+    delete globalThis[COMMAND_TERMINAL_KEY];
+  }
+
+  const state = { bot };
+  try {
+    if (process.stdin?.setEncoding) {
+      process.stdin.setEncoding('utf8');
+    }
+    process.stdin?.resume?.();
+  } catch (err) {
+    // ignore failures when checking TTY status
+  }
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true,
+  });
+  rl.resume?.();
+  const promptText = '> ';
+  rl.setPrompt(promptText);
+  let closed = false;
+  const consoleState = console.__jarvisConsoleState;
+  const outputStream = rl.output ?? process.stdout;
+  const promptScheduler = createPromptScheduler(rl, outputStream, logger);
+
+  const schedulePromptRefresh = () => {
+    if (closed) return;
+    promptScheduler.schedule();
+  };
+
+  const cancelScheduledRefresh = () => {
+    promptScheduler.cancel();
+  };
+
+  const stdinErrorHandler = (err) => {
+    logger.command?.(`STDIN error: ${err?.message ?? err}`);
+    schedulePromptRefresh();
+  };
+
+  if (typeof process.stdin.on === 'function') {
+    process.stdin.on('error', stdinErrorHandler);
+  }
+
+  const controller = {
+    setBot(nextBot) {
+      state.bot = nextBot;
+      schedulePromptRefresh();
+    },
+    clearBot() {
+      state.bot = null;
+    },
+    refreshPrompt: () => {
+      if (closed) return;
+      promptScheduler.flush();
+    },
+    isClosed: () => closed,
+    rl,
+  };
+
+  schedulePromptRefresh();
+
+  const consolePromptUpdater = () => {
+    if (!closed) {
+      schedulePromptRefresh();
+    }
+  };
+
+  consoleState?.setPromptRefresher?.(consolePromptUpdater);
+
   rl.on('line', (line) => {
     const cmd = line.trim();
-    if (!cmd) return;
+    if (!cmd) {
+      schedulePromptRefresh();
+      return;
+    }
+    const activeBot = state.bot;
+    if (!activeBot) {
+      logger.command?.('No connected bot to receive manual command.');
+      schedulePromptRefresh();
+      return;
+    }
     try {
-      bot.chat(cmd);
-      logger.debug(`Manual command sent: ${cmd}`);
+      activeBot.chat(cmd);
+      logger.command?.(`Sent manual command: ${cmd}`);
     } catch (err) {
-      logger.warn(`Failed to send manual command: ${err.message}`);
+      logger.command?.(`Failed to send manual command: ${err.message}`);
+    }
+    schedulePromptRefresh();
+  });
+
+  rl.on('close', () => {
+    closed = true;
+    cancelScheduledRefresh();
+    controller.clearBot();
+    logger.command?.('Command terminal closed.');
+    delete globalThis[COMMAND_TERMINAL_KEY];
+    consoleState?.setPromptRefresher?.(null);
+    promptScheduler.stop();
+    if (typeof process.stdin.off === 'function') {
+      process.stdin.off('error', stdinErrorHandler);
+    } else if (typeof process.stdin.removeListener === 'function') {
+      process.stdin.removeListener('error', stdinErrorHandler);
     }
   });
-  rl.on('close', () => {
-    logger.info('Command terminal closed.');
+
+  rl.on('SIGINT', () => {
+    logger.command?.('Press Ctrl+C again to exit.');
+    schedulePromptRefresh();
   });
+
+  rl.on('error', (err) => {
+    logger.command?.(`Readline error: ${err?.message ?? err}`);
+    schedulePromptRefresh();
+  });
+
+  globalThis[COMMAND_TERMINAL_KEY] = controller;
+  return controller;
 }
 
-export function createBot(botConfig, aiController, behaviorConfig, sessionConfig, logger) {
+export function createBot(
+  botConfig,
+  aiController,
+  behaviorConfig,
+  sessionConfig,
+  logger,
+  lifecycleHandlers = {}
+) {
   const bot = mineflayer.createBot({
     host: botConfig.host,
     port: botConfig.port,
@@ -125,26 +441,6 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
     viewDistance: botConfig.viewDistance,
   });
 
-  // Suppress noisy partial packet warnings from underlying libraries. Some
-  // versions of minecraft-protocol/protodef emit warnings via
-  // console.warn when they encounter unknown or truncated packets (e.g.,
-  // "Chunk size is 330 but only 222 was read ; partial packet"). These
-  // warnings are harmless and clutter the console. Override console.warn
-  // to ignore messages containing "partial packet" or "Chunk size is".
-  const originalConsoleWarn = console.warn;
-  console.warn = (...args) => {
-    try {
-      const first = args[0];
-      if (typeof first === 'string' && (first.includes('partial packet') || first.includes('Chunk size is'))) {
-        // Ignore these noisy protocol warnings
-        return;
-      }
-    } catch (e) {
-      // ignore errors in filtering
-    }
-    originalConsoleWarn.apply(console, args);
-  };
-
   // ✅ Load the plugins using the fixed import
   bot.loadPlugin(pathfinder);
   bot.loadPlugin(collectBlockPlugin);
@@ -153,7 +449,20 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
   const authState = {
     captchaSolved: false,
     registerSent: false,
-    loginSent: false
+    loginSent: false,
+    registerSentAt: 0,
+    loginSentAt: 0,
+  };
+
+  const lifecycle = lifecycleHandlers ?? {};
+  const terminalController = setupCommandTerminal(bot, logger);
+  terminalController?.setBot?.(bot);
+  let terminationNotified = false;
+
+  const notifyDisconnect = (reasonText, meta = {}) => {
+    if (terminationNotified) return;
+    terminationNotified = true;
+    lifecycle.onDisconnect?.(reasonText, meta);
   };
 
   /**
@@ -230,39 +539,33 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
 
   bot.once('spawn', () => {
     logger.info(`Spawned at ${bot.entity.position}`);
+    logger.server?.(`Spawned at ${bot.entity.position}`);
     if (aiController?.enabled) {
       aiController.appendHistory('system', 'Bot spawned in the world.');
     }
 
     autonomy?.pause?.(behaviorConfig?.autonomous?.idlePauseMs ?? 15000);
 
-    if (behaviorConfig?.auth?.enabled) {
-      const { auth } = behaviorConfig;
-      // If the server does not require solving a captcha before auth, send
-      // registration/login commands immediately upon spawn. Otherwise, wait
-      // until the captcha is solved; sendAuthCommandsIfNeeded() will handle it.
-      if (!behaviorConfig?.auth?.requireCaptcha) {
-        const messagesToSend = [];
-        if (auth.autoRegister && auth.registerCommand) {
-          messagesToSend.push(auth.registerCommand);
-        }
-        if (auth.autoLogin && auth.loginCommand) {
-          messagesToSend.push(auth.loginCommand);
-        }
-        messagesToSend.forEach((command, index) => {
-          const delay = randomDelay(2500 + index * 1200, 5000 + index * 1800);
-          setTimeout(() => {
-            queueHumanLikeChat(bot, command, behaviorConfig);
-          }, delay);
-        });
+    const authSettings = behaviorConfig?.auth;
+    if (authSettings?.enabled) {
+      if (authSettings.requireCaptcha === true) {
+        authState.captchaSolved = false;
+      } else {
+        authState.captchaSolved = true;
+        const delay = randomDelay(2200, 4200);
+        setTimeout(() => {
+          sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
+        }, delay);
       }
     }
+
+    lifecycle.onSpawn?.(bot);
   });
 
   bot.on('chat', (username, message) => {
     if (username === bot.username) return;
-    // Log chat messages at debug level to avoid spamming the console
-    logger.debug(`${username}: ${message}`);
+    // Route chat through the chat logger so the console stays focused on conversation
+    logger.chat?.(username, message);
     if (aiController?.enabled && !message.startsWith('!')) {
       aiController.appendHistory('user', `${username}: ${message}`);
     }
@@ -304,164 +607,132 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
    * and should work with most AuthMe‑style CAPTCHA plugins【633009359541956†L390-L396】.
    */
   bot.on('messagestr', (message) => {
-    // Normalize the message to lower case for keyword checks but keep original for regex
-    const lower = message.toLowerCase();
-    // If the message contains the word "captcha", attempt to extract a verification code.
-    // There are two common patterns:
-    //   1. The message includes a `/captcha <code>` command (handled below).
-    //   2. The message simply displays a code after the word "captcha" or "captcha code"
-    //      (e.g. "CAPTCHA: QF2A7" or "Captcha code: abc123").
-    if (lower.includes('captcha')) {
-      // Pattern 1: a command like "/captcha abcd123" or "need_captcha type: /captcha 1234"
-      const codeCmdMatch = message.match(/\/captcha\s+([0-9a-zA-Z]+)/i);
-      if (codeCmdMatch) {
-        const code = codeCmdMatch[1];
-        logger.debug(`Detected CAPTCHA code '${code}' in message: ${message}`);
-        const delay = randomDelay(700, 1400);
-        setTimeout(() => {
-          try {
-            bot.chat(`/captcha ${code}`);
-            logger.debug(`Sent /captcha ${code} to solve CAPTCHA`);
-            authState.captchaSolved = true;
-            // After solving captcha, attempt to send auth commands
-            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig);
-          } catch (err) {
-            logger.warn(`Failed to send CAPTCHA response: ${err.message}`);
-          }
-        }, delay);
-        return;
-      }
-      // Pattern 2: a standalone code after the word "captcha" (with optional "code" label)
-      const codeStandaloneMatch = message.match(/captcha(?:\s*code)?\s*[:]?\s*([0-9A-Za-z]{3,10})/i);
-      if (codeStandaloneMatch) {
-        const code = codeStandaloneMatch[1];
-        logger.debug(`Detected standalone CAPTCHA code '${code}' in message: ${message}`);
-        const delay = randomDelay(700, 1400);
-        setTimeout(() => {
-          try {
-            // If the original message includes "/captcha", send the command form; otherwise send the raw code.
-            if (/\/captcha/i.test(message)) {
-              bot.chat(`/captcha ${code}`);
-              logger.debug(`Sent /captcha ${code} to solve CAPTCHA`);
-            } else {
-              bot.chat(code);
-              logger.debug(`Sent raw code '${code}' to solve CAPTCHA`);
-            }
-            authState.captchaSolved = true;
-            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig);
-          } catch (err) {
-            logger.warn(`Failed to send CAPTCHA response: ${err.message}`);
-          }
-        }, delay);
-        return;
-      }
-
-      // Pattern 3: a generic verification code preceded by "code" or "verification code"
-      // Some plugins might display "code: 1234" or "verification code 123ABC" without
-      // mentioning the word "captcha". We match alphanumeric sequences of 3–10 characters
-      // following these keywords. We still prefix our response with `/captcha` since
-      // servers generally expect the command.
-      const codeGenericMatch = message.match(/(?:verification\s*)?code\s*[:]?\s*([0-9A-Za-z]{3,10})/i);
-      if (codeGenericMatch) {
-        const code = codeGenericMatch[1];
-        logger.debug(`Detected generic code '${code}' in message: ${message}`);
-        const delay = randomDelay(700, 1400);
-        setTimeout(() => {
-          try {
-            if (/\/captcha/i.test(message)) {
-              bot.chat(`/captcha ${code}`);
-              logger.debug(`Sent /captcha ${code} to solve generic code CAPTCHA`);
-            } else {
-              bot.chat(code);
-              logger.debug(`Sent raw code '${code}' to solve generic code CAPTCHA`);
-            }
-            authState.captchaSolved = true;
-            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig);
-          } catch (err) {
-            logger.warn(`Failed to send CAPTCHA response: ${err.message}`);
-          }
-        }, delay);
-        return;
+    const plainMessage = stripMinecraftFormatting(message);
+    if (plainMessage) {
+      const isPlayerChat = /^<[^>]+>\s/.test(plainMessage);
+      if (!isPlayerChat) {
+        logger.server?.(plainMessage);
       }
     }
-    // Look for simple arithmetic expressions (e.g. "3 + 5") in any message. Some plugins
-    // require solving a math problem instead of entering a code. We capture two numbers
-    // and a basic operator, compute the result, and send it via `/captcha <result>`.
-    const mathMatch = message.match(/(\d+)\s*([+\-*/])\s*(\d+)/);
-    if (mathMatch) {
-      const a = parseInt(mathMatch[1], 10);
-      const op = mathMatch[2];
-      const b = parseInt(mathMatch[3], 10);
-      let result;
-      switch (op) {
-        case '+':
-          result = a + b;
-          break;
-        case '-':
-          result = a - b;
-          break;
-        case '*':
-          result = a * b;
-          break;
-        case '/':
-          // Avoid division by zero; compute integer division like Minecraft chat expects
-          if (b === 0) return;
-          result = Math.floor(a / b);
-          break;
-        default:
-          return;
-      }
-      logger.debug(`Detected math CAPTCHA '${mathMatch[0]}' with answer ${result}`);
+
+    maybeHandleAuthPrompts(bot, plainMessage, authState, behaviorConfig, logger);
+
+    // Normalize the message to lower case for keyword checks but keep original for regex
+    const lower = plainMessage.toLowerCase();
+    let handled = false;
+
+    // Pattern 1: a command like "/captcha abcd123" or "need_captcha type: /captcha 1234"
+    const codeCmdMatch = plainMessage.match(/\/captcha\s+([0-9a-zA-Z]+)/i);
+    if (!handled && codeCmdMatch) {
+      const code = codeCmdMatch[1];
+      logger.captcha?.(`Detected CAPTCHA command: ${plainMessage}`);
       const delay = randomDelay(700, 1400);
       setTimeout(() => {
         try {
-          // Send command form if the message contains "/captcha"; otherwise send just the answer
-          if (/\/captcha/i.test(message)) {
-            bot.chat(`/captcha ${result}`);
-            logger.debug(`Sent /captcha ${result} to solve math CAPTCHA`);
-          } else {
-            bot.chat(String(result));
-            logger.debug(`Sent raw answer '${result}' to solve math CAPTCHA`);
-          }
+          bot.chat(`/captcha ${code}`);
+          logger.captcha?.(`Solved CAPTCHA by sending /captcha ${code}.`);
           authState.captchaSolved = true;
-          sendAuthCommandsIfNeeded(bot, authState, behaviorConfig);
+          sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
         } catch (err) {
-          logger.warn(`Failed to send math CAPTCHA response: ${err.message}`);
+          logger.warn(`Failed to send CAPTCHA response: ${err.message}`);
         }
       }, delay);
+      handled = true;
     }
-  });
 
-  // After handling captchas, watch for register and login prompts. Some servers will instruct
-  // the player to use `/register` or `/login` after solving a captcha. We detect these
-  // prompts and send the appropriate command from the behavior configuration. We avoid
-  // sending duplicates by tracking authState flags and only proceed once the captcha
-  // challenge is satisfied (if required).
-  bot.on('messagestr', (message) => {
-    const lowerMsg = message.toLowerCase();
-    // If a captcha is required and hasn’t been solved yet, don’t respond to auth prompts.
-    if (behaviorConfig?.auth?.requireCaptcha && !authState.captchaSolved) return;
-    // Registration prompt detection
-    if (!authState.registerSent && lowerMsg.includes('/register')) {
-      const registerCmd = behaviorConfig?.auth?.registerCommand;
-      if (registerCmd) {
-        authState.registerSent = true;
-        const delay = randomDelay(1200, 2500);
+    // Pattern 2: a standalone code after the word "captcha" (with optional "code" label)
+    if (!handled && lower.includes('captcha')) {
+      const codeStandaloneMatch = plainMessage.match(/captcha(?:\s*code)?\s*[:]?\s*([0-9A-Za-z]{3,10})/i);
+      if (codeStandaloneMatch) {
+        const code = codeStandaloneMatch[1];
+        logger.captcha?.(`Detected CAPTCHA code ${code} in message: ${plainMessage}`);
+        const delay = randomDelay(700, 1400);
         setTimeout(() => {
-          logger.debug(`Detected register prompt ('${message}'); sending register command.`);
-          queueHumanLikeChat(bot, registerCmd, behaviorConfig);
+          try {
+            if (/\/captcha/i.test(plainMessage)) {
+              bot.chat(`/captcha ${code}`);
+              logger.captcha?.(`Solved CAPTCHA by sending /captcha ${code}.`);
+            } else {
+              bot.chat(code);
+              logger.captcha?.(`Solved CAPTCHA by sending code ${code}.`);
+            }
+            authState.captchaSolved = true;
+            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
+          } catch (err) {
+            logger.warn(`Failed to send CAPTCHA response: ${err.message}`);
+          }
         }, delay);
+        handled = true;
       }
     }
-    // Login prompt detection
-    if (!authState.loginSent && lowerMsg.includes('/login')) {
-      const loginCmd = behaviorConfig?.auth?.loginCommand;
-      if (loginCmd) {
-        authState.loginSent = true;
-        const delay = randomDelay(1200, 2500);
+
+    // Pattern 3: a generic verification code preceded by "code" or "verification code"
+    if (!handled) {
+      const codeGenericMatch = plainMessage.match(/(?:verification\s*)?code\s*[:]?\s*([0-9A-Za-z]{3,10})/i);
+      if (codeGenericMatch) {
+        const code = codeGenericMatch[1];
+        logger.captcha?.(`Detected verification code ${code} in message: ${plainMessage}`);
+        const delay = randomDelay(700, 1400);
         setTimeout(() => {
-          logger.debug(`Detected login prompt ('${message}'); sending login command.`);
-          queueHumanLikeChat(bot, loginCmd, behaviorConfig);
+          try {
+            if (/\/captcha/i.test(plainMessage)) {
+              bot.chat(`/captcha ${code}`);
+              logger.captcha?.(`Solved CAPTCHA by sending /captcha ${code}.`);
+            } else {
+              bot.chat(code);
+              logger.captcha?.(`Solved CAPTCHA by sending code ${code}.`);
+            }
+            authState.captchaSolved = true;
+            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
+          } catch (err) {
+            logger.warn(`Failed to send CAPTCHA response: ${err.message}`);
+          }
+        }, delay);
+        handled = true;
+      }
+    }
+
+    // Pattern 4: simple arithmetic expressions like "3 + 5"
+    if (!handled) {
+      const mathMatch = plainMessage.match(/(\d+)\s*([+\-*/])\s*(\d+)/);
+      if (mathMatch) {
+        const a = parseInt(mathMatch[1], 10);
+        const op = mathMatch[2];
+        const b = parseInt(mathMatch[3], 10);
+        let result;
+        switch (op) {
+          case '+':
+            result = a + b;
+            break;
+          case '-':
+            result = a - b;
+            break;
+          case '*':
+            result = a * b;
+            break;
+          case '/':
+            if (b === 0) return;
+            result = Math.floor(a / b);
+            break;
+          default:
+            return;
+        }
+        logger.captcha?.(`Detected math CAPTCHA "${mathMatch[0]}" with answer ${result}.`);
+        const delay = randomDelay(700, 1400);
+        setTimeout(() => {
+          try {
+            if (/\/captcha/i.test(plainMessage)) {
+              bot.chat(`/captcha ${result}`);
+              logger.captcha?.(`Solved CAPTCHA by sending /captcha ${result}.`);
+            } else {
+              bot.chat(String(result));
+              logger.captcha?.(`Solved CAPTCHA by sending answer ${result}.`);
+            }
+            authState.captchaSolved = true;
+            sendAuthCommandsIfNeeded(bot, authState, behaviorConfig, logger);
+          } catch (err) {
+            logger.warn(`Failed to send math CAPTCHA response: ${err.message}`);
+          }
         }, delay);
       }
     }
@@ -483,17 +754,31 @@ export function createBot(botConfig, aiController, behaviorConfig, sessionConfig
       return;
     }
     logger.error('Bot encountered an error', error);
+    const message = error?.message ? `Bot error: ${error.message}` : 'Bot encountered an unknown error.';
+    logger.server?.(message);
+    lifecycle.onError?.(error);
+  });
+
+  bot.on('kicked', (reason) => {
+    const text = formatDisconnectReason(reason);
+    logger.server?.(`Kicked from server${text ? `: ${text}` : ''}`);
+    lifecycle.onKicked?.(text);
+    notifyDisconnect(text, { type: 'kicked' });
   });
 
   bot.on('end', (reason) => {
-    logger.warn(`Bot disconnected: ${reason}`);
+    const text = formatDisconnectReason(reason);
+    logger.warn(`Bot disconnected: ${text}`);
+    logger.server?.(`Connection closed${text ? `: ${text}` : ''}`);
+    notifyDisconnect(text, { type: 'end' });
+    terminalController?.clearBot?.();
   });
 
   // Expose a command terminal on stdin for manual control. This should be set up
   // after creating the bot so the user can type commands into the console and
   // have them sent directly to the game. It runs immediately and does not wait
   // for spawn, so commands entered before join will be queued by Mineflayer.
-  setupCommandTerminal(bot, logger);
+  // Already configured above via setupCommandTerminal/bot binding.
 
   return bot;
 }
