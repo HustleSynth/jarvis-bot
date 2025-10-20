@@ -54,16 +54,56 @@ const RESOURCE_BLOCKS = new Set([
   'deepslate_copper_ore',
 ]);
 
+const WOOD_BLOCKS = new Set([
+  'oak_log',
+  'birch_log',
+  'spruce_log',
+  'jungle_log',
+  'acacia_log',
+  'dark_oak_log',
+  'mangrove_log',
+  'cherry_log',
+  'pale_oak_log',
+  'bamboo_block',
+  'crimson_stem',
+  'warped_stem',
+]);
+
+const WEAPON_PRIORITIES = new Map([
+  ['netherite_sword', 9],
+  ['diamond_sword', 8],
+  ['iron_sword', 7],
+  ['netherite_axe', 7],
+  ['trident', 7],
+  ['stone_sword', 6],
+  ['diamond_axe', 6],
+  ['wooden_sword', 5],
+  ['iron_axe', 5],
+  ['stone_axe', 4],
+  ['golden_sword', 4],
+  ['wooden_axe', 3],
+  ['golden_axe', 3],
+  ['diamond_pickaxe', 2],
+  ['iron_pickaxe', 2],
+  ['stone_pickaxe', 1],
+  ['wooden_pickaxe', 1],
+]);
+
+const SHIELD_ITEMS = new Set(['shield']);
+
 const TaskType = Object.freeze({
   FOLLOW_PLAYER: 'follow_player',
   EXPLORE: 'explore',
   INVESTIGATE_POI: 'investigate_poi',
   COLLECT_ITEM: 'collect_item',
   MINE_RESOURCE: 'mine_resource',
+  HARVEST_WOOD: 'harvest_wood',
   EVADE_THREAT: 'evade_threat',
   OBSERVE: 'observe',
   SOCIALIZE: 'socialize',
   STROLL: 'stroll',
+  COMBAT: 'combat',
+  GROUP_FOLLOW: 'group_follow',
 });
 
 function cloneVec(vec) {
@@ -98,6 +138,67 @@ function addNoiseToPosition(position, radius) {
   return position.plus(offset);
 }
 
+function vecEquals(a, b) {
+  if (!a || !b) return false;
+  if (typeof a.equals === 'function') {
+    return a.equals(b);
+  }
+  return a.x === b.x && a.y === b.y && a.z === b.z;
+}
+
+function scoreWeapon(item) {
+  if (!item) return 0;
+  const direct = WEAPON_PRIORITIES.get(item.name);
+  if (direct) return direct;
+  const cleaned = item.name?.replace(/^minecraft:/, '') ?? '';
+  return WEAPON_PRIORITIES.get(cleaned) ?? 0;
+}
+
+function findBestWeapon(bot) {
+  const inventoryItems = typeof bot?.inventory?.items === 'function' ? bot.inventory.items() : bot?.inventory?.items ?? [];
+  let best = null;
+  let bestScore = 0;
+  for (const item of inventoryItems) {
+    const score = scoreWeapon(item);
+    if (score > bestScore) {
+      best = item;
+      bestScore = score;
+    }
+  }
+  return bestScore > 0 ? best : null;
+}
+
+function findShield(bot) {
+  const inventoryItems = typeof bot?.inventory?.items === 'function' ? bot.inventory.items() : bot?.inventory?.items ?? [];
+  for (const item of inventoryItems) {
+    const name = item.name?.replace(/^minecraft:/, '') ?? '';
+    if (SHIELD_ITEMS.has(item.name) || SHIELD_ITEMS.has(name)) {
+      return item;
+    }
+  }
+  return null;
+}
+
+async function equipItem(bot, item, destination, logger) {
+  if (!bot || !item) return;
+  try {
+    await bot.equip(item, destination);
+  } catch (error) {
+    logger?.debug?.(`Failed to equip ${item?.name} to ${destination}: ${error?.message ?? error}`);
+  }
+}
+
+function equipForCombat(bot, logger) {
+  const weapon = findBestWeapon(bot);
+  if (weapon) {
+    equipItem(bot, weapon, 'hand', logger);
+  }
+  const shield = findShield(bot);
+  if (shield) {
+    equipItem(bot, shield, 'off-hand', logger);
+  }
+}
+
 function createDefaultBrainConfig(behaviorConfig) {
   const settings = behaviorConfig?.autonomous || {};
   return {
@@ -112,12 +213,15 @@ function createDefaultBrainConfig(behaviorConfig) {
     poiForgetMs: 60_000,
     hostileForgetMs: 20_000,
     itemForgetMs: 12_000,
+    resourceForgetMs: settings.resourceForgetMs || 90_000,
     lowHealthThreshold: 12,
     dangerCooldownMs: 15_000,
     investigationRadius: 24,
     curiosityIntervalMs: 25_000,
     allowMining: behaviorConfig?.allowMining !== false,
+    allowWoodHarvest: behaviorConfig?.allowWoodHarvest !== false,
     allowCollect: behaviorConfig?.allowCollect !== false,
+    allowCombat: behaviorConfig?.allowCombat !== false,
     microGestureIntervalMs: settings.microGestureIntervalMs || 4500,
     lookAtPlayerRange: settings.lookAtPlayerRange || 10,
     observationChance: settings.observationChance ?? 0.3,
@@ -126,6 +230,15 @@ function createDefaultBrainConfig(behaviorConfig) {
     strollChance: settings.strollChance ?? 0.55,
     strollDurationRange: settings.strollDurationRange || [5000, 9000],
     manualMoveCooldownMs: settings.manualMoveCooldownMs || 25_000,
+    combatEngageHealth: settings.combatEngageHealth ?? 14,
+    combatDisengageHealth: settings.combatDisengageHealth ?? 6,
+    combatCooldownMs: settings.combatCooldownMs || 9000,
+    combatSwingIntervalMs: settings.combatSwingIntervalMs || 450,
+    combatLookIntervalMs: settings.combatLookIntervalMs || 200,
+    combatMaxChaseDistance: settings.combatMaxChaseDistance || 18,
+    groupFollowRadius: settings.groupFollowRadius || 12,
+    groupFollowLeash: settings.groupFollowLeash || 20,
+    groupMinSize: settings.groupMinSize || 2,
   };
 }
 
@@ -148,9 +261,11 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
       hostiles: new Map(),
       items: new Map(),
       pois: [],
-      interestingBlocks: [],
+      resourceTargets: [],
     },
     managedTimeouts: new Set(),
+    combatCooldownUntil: 0,
+    lastCombatTime: 0,
   };
 
   function registerTimeout(callback, delay, bucket = state.managedTimeouts) {
@@ -251,6 +366,69 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     });
   }
 
+  function rememberResourceTarget(block, kind, priority = 1) {
+    if (!block?.position) return;
+    const position = cloneVec(block.position);
+    const blockName = block.name;
+    const existingIndex = state.memory.resourceTargets.findIndex((entry) => vecEquals(entry.position, position));
+    const entry = {
+      position,
+      blockName,
+      kind,
+      priority,
+      notedAt: Date.now(),
+    };
+    if (existingIndex >= 0) {
+      state.memory.resourceTargets[existingIndex] = {
+        ...state.memory.resourceTargets[existingIndex],
+        ...entry,
+      };
+    } else {
+      state.memory.resourceTargets.push(entry);
+    }
+    state.memory.resourceTargets.sort((a, b) => b.priority - a.priority);
+    if (state.memory.resourceTargets.length > 12) {
+      state.memory.resourceTargets.length = 12;
+    }
+  }
+
+  function removeResourceTarget(target) {
+    if (!target?.position) return;
+    state.memory.resourceTargets = state.memory.resourceTargets.filter((entry) => !vecEquals(entry.position, target.position));
+  }
+
+  function resolveResourceBlock(target) {
+    if (!target?.position) return null;
+    try {
+      const block = bot.blockAt(target.position);
+      if (!block) return null;
+      if (target.blockName && block.name !== target.blockName) {
+        return null;
+      }
+      return block;
+    } catch (error) {
+      logger.debug?.(`Failed to resolve resource block: ${error.message}`);
+      return null;
+    }
+  }
+
+  function selectResourceTarget() {
+    if (!state.memory.resourceTargets.length) return null;
+    const botPosition = bot.entity?.position;
+    const scored = state.memory.resourceTargets
+      .map((entry) => {
+        const dist = botPosition ? Math.sqrt(distanceSquared(botPosition, entry.position)) : Infinity;
+        return { entry, dist };
+      })
+      .sort((a, b) => {
+        if (b.entry.priority !== a.entry.priority) {
+          return b.entry.priority - a.entry.priority;
+        }
+        return a.dist - b.dist;
+      });
+    return scored[0]?.entry ?? null;
+  }
+
   function forgetStaleMemory() {
     const now = Date.now();
     for (const [username, info] of state.memory.players) {
@@ -268,6 +446,19 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
         state.memory.items.delete(id);
       }
     }
+    state.memory.resourceTargets = state.memory.resourceTargets.filter((entry) => {
+      if (!entry) return false;
+      if (now - entry.notedAt > brainConfig.resourceForgetMs) return false;
+      if (!entry.position) return false;
+      try {
+        const block = bot.blockAt(entry.position);
+        if (!block) return now - entry.notedAt < 5000;
+        return block.name === entry.blockName;
+      } catch (error) {
+        logger.debug?.(`Failed to validate resource target: ${error.message}`);
+        return now - entry.notedAt < brainConfig.resourceForgetMs * 0.5;
+      }
+    });
     state.memory.pois = state.memory.pois.filter((poi) => now - poi.notedAt <= brainConfig.poiForgetMs);
   }
 
@@ -298,14 +489,40 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
           maxDistance: 32,
           count: 3,
         });
-        state.memory.interestingBlocks = foundPositions
-          .map((vec) => {
+        for (const vec of foundPositions) {
+          try {
             const block = bot.blockAt(vec);
-            return block ? { block, position: cloneVec(block.position), notedAt: Date.now() } : null;
-          })
-          .filter(Boolean);
+            if (block) {
+              rememberResourceTarget(block, 'ore', 3);
+            }
+          } catch (error) {
+            logger.debug?.(`Failed to inspect ore block: ${error.message}`);
+          }
+        }
       } catch (error) {
         logger.debug(`Failed scanning for resources: ${error.message}`);
+      }
+    }
+
+    if (brainConfig.allowWoodHarvest) {
+      try {
+        const woodPositions = bot.findBlocks({
+          matching: (block) => block && WOOD_BLOCKS.has(block.name),
+          maxDistance: 28,
+          count: 5,
+        });
+        for (const vec of woodPositions) {
+          try {
+            const block = bot.blockAt(vec);
+            if (block) {
+              rememberResourceTarget(block, 'wood', 2);
+            }
+          } catch (error) {
+            logger.debug?.(`Failed to inspect wood block: ${error.message}`);
+          }
+        }
+      } catch (error) {
+        logger.debug(`Failed scanning for wood: ${error.message}`);
       }
     }
   }
@@ -358,6 +575,55 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     return nearest;
   }
 
+  function computePlayerGroups() {
+    const players = Array.from(state.memory.players.values());
+    if (players.length < brainConfig.groupMinSize) return [];
+    const radius = Math.max(2, brainConfig.groupFollowRadius || 12);
+    const radiusSquared = radius * radius;
+    const groups = new Map();
+    for (const info of players) {
+      const members = players.filter((other) => distanceSquared(info.position, other.position) <= radiusSquared);
+      if (members.length < brainConfig.groupMinSize) continue;
+      const key = members
+        .map((member) => member.username)
+        .sort()
+        .join('|');
+      if (groups.has(key)) continue;
+      const center = members.reduce(
+        (acc, member) => {
+          acc.x += member.position.x;
+          acc.y += member.position.y;
+          acc.z += member.position.z;
+          return acc;
+        },
+        { x: 0, y: 0, z: 0 },
+      );
+      const size = members.length;
+      const centerVec = new Vec3(
+        Math.round(center.x / size),
+        Math.round(center.y / size),
+        Math.round(center.z / size),
+      );
+      groups.set(key, { members, size, center: centerVec, notedAt: Date.now() });
+    }
+    return Array.from(groups.values());
+  }
+
+  function strongestGroupInfo() {
+    const groups = computePlayerGroups();
+    if (groups.length === 0) return null;
+    const botPosition = bot.entity?.position;
+    return groups
+      .map((group) => ({
+        ...group,
+        distance: botPosition ? Math.sqrt(distanceSquared(botPosition, group.center)) : Infinity,
+      }))
+      .sort((a, b) => {
+        if (b.size !== a.size) return b.size - a.size;
+        return a.distance - b.distance;
+      })[0];
+  }
+
   function chooseAmbientLine() {
     const defaultLines = [
       'Just checking on things around here.',
@@ -396,6 +662,130 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     return botPosition.plus(escapeVector);
   }
 
+  function shouldEngageThreat(threatInfo, threatDistance) {
+    if (!brainConfig.allowCombat) return false;
+    if (Date.now() < state.combatCooldownUntil) return false;
+    if (!threatInfo?.entityId) return false;
+    if (bot.health < brainConfig.combatEngageHealth) return false;
+    const entity = bot.entities?.[threatInfo.entityId];
+    if (!entity || !entity.position) return false;
+    const display = (entity.displayName || entity.name || '').toLowerCase();
+    if (display.includes('creeper')) return false;
+    if (threatDistance && threatDistance > brainConfig.combatMaxChaseDistance) return false;
+    const weapon = findBestWeapon(bot);
+    return Boolean(weapon);
+  }
+
+  function combatTask(threatInfo) {
+    if (!threatInfo?.entityId) return null;
+    const entityId = threatInfo.entityId;
+    const entity = bot.entities?.[entityId];
+    if (!entity) return null;
+    const timers = new Set();
+    let activeGoal = null;
+
+    const scheduleTimer = (fn, delay) => registerTimeout(fn, delay, timers);
+
+    const clearTimers = () => {
+      for (const timer of timers) {
+        clearManagedTimeout(timer, timers);
+      }
+      timers.clear();
+    };
+
+    const swing = () => {
+      if (state.currentTask?.type !== TaskType.COMBAT) return;
+      const target = bot.entities?.[entityId];
+      if (!target || !target.position || !bot.entity?.position) return;
+      const distance = Math.sqrt(distanceSquared(bot.entity.position, target.position));
+      const lookPos = target.position.offset(0, target.height ?? 1.6, 0);
+      bot.lookAt(lookPos, true).catch(() => {});
+      if (distance <= 3.5) {
+        try {
+          bot.attack(target);
+        } catch (error) {
+          logger.debug(`Attack failed: ${error.message}`);
+        }
+        if (Math.random() < 0.35 && typeof bot.setControlState === 'function') {
+          bot.setControlState('jump', true);
+          scheduleTimer(() => bot.setControlState('jump', false), 200 + Math.random() * 240);
+        }
+      }
+    };
+
+    const attackLoop = () => {
+      if (state.currentTask?.type !== TaskType.COMBAT) return;
+      swing();
+      scheduleTimer(attackLoop, brainConfig.combatSwingIntervalMs);
+    };
+
+    const strafe = () => {
+      if (state.currentTask?.type !== TaskType.COMBAT) return;
+      if (typeof bot.setControlState === 'function') {
+        const dir = Math.random() < 0.5 ? 'left' : 'right';
+        bot.setControlState(dir, true);
+        scheduleTimer(() => bot.setControlState(dir, false), 240 + Math.random() * 240);
+      }
+      scheduleTimer(strafe, 1200 + Math.random() * 1400);
+    };
+
+    const refreshGoal = () => {
+      if (state.currentTask?.type !== TaskType.COMBAT) return;
+      const target = bot.entities?.[entityId];
+      if (!target || !target.position) return;
+      const goal = new Goals.GoalFollow(target, 1);
+      activeGoal = goal;
+      bot.pathfinder?.setMovements(movements);
+      bot.pathfinder?.setGoal(goal, true);
+      scheduleTimer(refreshGoal, 4500 + Math.random() * 2000);
+    };
+
+    const maintainFocus = () => {
+      if (state.currentTask?.type !== TaskType.COMBAT) return;
+      const target = bot.entities?.[entityId];
+      if (target?.position) {
+        bot.lookAt(target.position.offset(0, target.height ?? 1.6, 0), true).catch(() => {});
+      }
+      scheduleTimer(maintainFocus, brainConfig.combatLookIntervalMs);
+    };
+
+    return {
+      type: TaskType.COMBAT,
+      target: threatInfo,
+      startedAt: Date.now(),
+      cleanup: () => {
+        clearTimers();
+        if (bot.pathfinder?.goal === activeGoal) {
+          bot.pathfinder.setGoal(null);
+        }
+        activeGoal = null;
+        bot.deactivateItem?.();
+        clearControls();
+        state.combatCooldownUntil = Date.now() + brainConfig.combatCooldownMs;
+        state.lastCombatTime = Date.now();
+        state.memory.hostiles.delete(entityId);
+      },
+      continuePredicate: () => {
+        const target = bot.entities?.[entityId];
+        if (!target || target.health <= 0) return false;
+        if (!bot.entity?.position || !target.position) return false;
+        const distance = Math.sqrt(distanceSquared(bot.entity.position, target.position));
+        if (distance > brainConfig.combatMaxChaseDistance) return false;
+        if (bot.health <= brainConfig.combatDisengageHealth) return false;
+        return true;
+      },
+      engage: () => {
+        state.lastCombatTime = Date.now();
+        equipForCombat(bot, logger);
+        refreshGoal();
+        maintainFocus();
+        attackLoop();
+        strafe();
+        logger.warn(`Engaging ${threatInfo?.name || entityId} in combat.`);
+      },
+    };
+  }
+
   function followPlayerTask(targetInfo) {
     if (!targetInfo) return null;
     const { username } = targetInfo;
@@ -431,6 +821,73 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
         bot.pathfinder?.setMovements(movements);
         bot.pathfinder?.setGoal(goal, true);
         logger.info(`Following ${username}`);
+      },
+    };
+  }
+
+  function groupFollowTask(groupInfo) {
+    if (!groupInfo || !Array.isArray(groupInfo.members) || groupInfo.members.length < brainConfig.groupMinSize) {
+      return null;
+    }
+
+    const timers = new Set();
+    let activeGoal = null;
+
+    const cleanupTimers = () => {
+      for (const timer of timers) {
+        clearManagedTimeout(timer, timers);
+      }
+      timers.clear();
+    };
+
+    const updateGoal = () => {
+      if (state.currentTask?.type !== TaskType.GROUP_FOLLOW) return;
+      const currentGroup = strongestGroupInfo();
+      const referenceGroup = currentGroup && currentGroup.members.length >= brainConfig.groupMinSize ? currentGroup : groupInfo;
+      const anchor = referenceGroup.members.find((member) => bot.players?.[member.username]?.entity);
+      if (anchor) {
+        const entity = bot.players[anchor.username].entity;
+        const goal = new Goals.GoalFollow(entity, brainConfig.followDistance + 1);
+        activeGoal = goal;
+        bot.pathfinder?.setMovements(movements);
+        bot.pathfinder?.setGoal(goal, true);
+      } else if (referenceGroup.center) {
+        const goal = new Goals.GoalNear(
+          referenceGroup.center.x,
+          referenceGroup.center.y,
+          referenceGroup.center.z,
+          brainConfig.followDistance + 2,
+        );
+        activeGoal = goal;
+        bot.pathfinder?.setMovements(movements);
+        bot.pathfinder?.setGoal(goal);
+      }
+      registerTimeout(updateGoal, 4000 + Math.random() * 2000, timers);
+    };
+
+    return {
+      type: TaskType.GROUP_FOLLOW,
+      target: groupInfo,
+      startedAt: Date.now(),
+      cleanup: () => {
+        cleanupTimers();
+        if (bot.pathfinder?.goal === activeGoal) {
+          bot.pathfinder.setGoal(null);
+        }
+        clearControls();
+      },
+      continuePredicate: () => {
+        const currentGroup = strongestGroupInfo();
+        if (!currentGroup || currentGroup.members.length < brainConfig.groupMinSize) return false;
+        const botPos = bot.entity?.position;
+        if (!botPos) return false;
+        const dist = Math.sqrt(distanceSquared(botPos, currentGroup.center));
+        return dist <= Math.max(brainConfig.groupFollowLeash, brainConfig.followMaxDistance + 6);
+      },
+      engage: () => {
+        cleanupTimers();
+        updateGoal();
+        logger.info(`Shadowing nearby player group of ${groupInfo.members.length} players.`);
       },
     };
   }
@@ -665,6 +1122,7 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
 
   function mineResourceTask(resource) {
     if (!resource?.block) return null;
+    const blockName = resource.block?.name || resource.blockName || 'resource';
     return {
       type: TaskType.MINE_RESOURCE,
       target: resource,
@@ -687,10 +1145,12 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
         };
         collectPromise
           .then(() => {
-            logger.info(`Collected ${resource.block.name}`);
+            logger.info(`Collected ${blockName}`);
+            removeResourceTarget(resource);
           })
           .catch((error) => {
-            logger.warn(`Failed to collect ${resource.block.name}: ${error.message}`);
+            logger.warn(`Failed to collect ${blockName}: ${error.message}`);
+            removeResourceTarget(resource);
           })
           .finally(() => {
             state.asyncTask = null;
@@ -702,6 +1162,56 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
         if (state.asyncTask?.cancel) {
           state.asyncTask.cancel();
         }
+        state.asyncTask = null;
+        removeResourceTarget(resource);
+      },
+    };
+  }
+
+  function harvestWoodTask(resource) {
+    if (!resource?.block) return null;
+    const blockName = resource.block?.name || resource.blockName || 'wood';
+    return {
+      type: TaskType.HARVEST_WOOD,
+      target: resource,
+      startedAt: Date.now(),
+      engage: () => {
+        if (!bot.collectBlock) {
+          logger.warn('CollectBlock plugin missing; cannot harvest wood.');
+          return;
+        }
+        const collectPromise = bot.collectBlock.collect(resource.block);
+        state.asyncTask = {
+          promise: collectPromise,
+          cancel: () => {
+            try {
+              bot.collectBlock.cancelTask();
+            } catch (error) {
+              logger.debug(`Failed to cancel wood harvest: ${error.message}`);
+            }
+          },
+        };
+        collectPromise
+          .then(() => {
+            logger.info(`Gathered ${blockName}`);
+            removeResourceTarget(resource);
+          })
+          .catch((error) => {
+            logger.warn(`Failed to gather ${blockName}: ${error.message}`);
+            removeResourceTarget(resource);
+          })
+          .finally(() => {
+            state.asyncTask = null;
+            state.currentTask = null;
+          });
+      },
+      continuePredicate: () => Boolean(bot.collectBlock),
+      cleanup: () => {
+        if (state.asyncTask?.cancel) {
+          state.asyncTask.cancel();
+        }
+        state.asyncTask = null;
+        removeResourceTarget(resource);
       },
     };
   }
@@ -786,11 +1296,21 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     const nearestThreat = nearestHostileInfo();
     if (nearestThreat) {
       const botPos = bot.entity?.position;
-      if (botPos) {
-        const threatDistance = Math.sqrt(distanceSquared(botPos, nearestThreat.position));
-        if (threatDistance < 8 || now - state.lastDamageTime < brainConfig.dangerCooldownMs || bot.health < brainConfig.lowHealthThreshold) {
-          return evadeThreatTask(nearestThreat);
+      const entity = nearestThreat.entityId ? bot.entities?.[nearestThreat.entityId] : null;
+      const threatPos = entity?.position || nearestThreat.position;
+      const threatDistance = botPos && threatPos ? Math.sqrt(distanceSquared(botPos, threatPos)) : Infinity;
+      if (shouldEngageThreat(nearestThreat, threatDistance)) {
+        const combat = combatTask(nearestThreat);
+        if (combat) {
+          return combat;
         }
+      }
+      if (
+        (Number.isFinite(threatDistance) && threatDistance < 8) ||
+        now - state.lastDamageTime < brainConfig.dangerCooldownMs ||
+        bot.health < brainConfig.lowHealthThreshold
+      ) {
+        return evadeThreatTask(nearestThreat);
       }
     }
 
@@ -804,16 +1324,39 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
       }
     }
 
-    if (brainConfig.allowMining) {
-      const resource = state.memory.interestingBlocks[0];
-      if (resource) {
-        return mineResourceTask(resource);
+    if ((brainConfig.allowMining || brainConfig.allowWoodHarvest) && state.memory.resourceTargets.length > 0) {
+      const candidate = selectResourceTarget();
+      if (candidate) {
+        const block = resolveResourceBlock(candidate);
+        if (!block) {
+          removeResourceTarget(candidate);
+        } else if (candidate.kind === 'ore' && brainConfig.allowMining) {
+          return mineResourceTask({ ...candidate, block });
+        } else if (candidate.kind === 'wood' && brainConfig.allowWoodHarvest) {
+          return harvestWoodTask({ ...candidate, block });
+        }
       }
     }
 
     if (state.memory.pois.length > 0) {
       const poi = state.memory.pois[0];
       return investigatePoiTask(poi);
+    }
+
+    const group = strongestGroupInfo();
+    if (group) {
+      const botPos = bot.entity?.position;
+      const dist = botPos ? Math.sqrt(distanceSquared(botPos, group.center)) : Infinity;
+      if (
+        Number.isFinite(dist) &&
+        dist > brainConfig.followDistance &&
+        dist < Math.max(brainConfig.groupFollowLeash, brainConfig.followMaxDistance + 6)
+      ) {
+        const groupTask = groupFollowTask(group);
+        if (groupTask) {
+          return groupTask;
+        }
+      }
     }
 
     const nearestPlayer = nearestPlayerInfo();
@@ -853,7 +1396,7 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     if (state.asyncTask?.promise) return;
 
     const current = state.currentTask;
-    if (current?.type === TaskType.EVADE_THREAT) return;
+    if (current?.type === TaskType.EVADE_THREAT || current?.type === TaskType.COMBAT) return;
 
     const botPosition = bot.entity.position;
     const nearest = nearestPlayerInfo();
@@ -930,6 +1473,12 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
     state.memory.pois = state.memory.pois.slice(0, 6);
   }
 
+  bot.on('health', () => {
+    if (bot.health < brainConfig.combatDisengageHealth) {
+      state.lastDamageTime = Date.now();
+    }
+  });
+
   bot.on('entityHurt', (entity) => {
     if (entity.id === bot.entity?.id) {
       state.lastDamageTime = Date.now();
@@ -956,6 +1505,12 @@ export function createCognitiveBrain(bot, logger, aiController, behaviorConfig) 
   });
 
   bot.on('blockUpdate', (oldBlock, newBlock) => {
+    if (oldBlock?.position) {
+      const match = state.memory.resourceTargets.find((entry) => vecEquals(entry.position, oldBlock.position));
+      if (match && (!newBlock || newBlock.name !== match.blockName)) {
+        removeResourceTarget(match);
+      }
+    }
     const interestingBlocks = ['crafting_table', 'furnace', 'chest', 'ender_chest', 'smithing_table'];
     const block = newBlock || oldBlock;
     if (!block?.name) return;

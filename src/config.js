@@ -37,6 +37,8 @@ export const behaviorConfig = {
   allowMining: process.env.ALLOW_MINING !== 'false',
   allowBuilding: process.env.ALLOW_BUILDING !== 'false',
   allowCollect: process.env.ALLOW_COLLECT !== 'false',
+  allowCombat: process.env.ALLOW_COMBAT !== 'false',
+  allowWoodHarvest: process.env.ALLOW_WOOD_HARVEST !== 'false',
   defaultGoalRange: toNumber(process.env.DEFAULT_GOAL_RANGE, 1),
   humanChatDelay: {
     min: toNumber(process.env.CHAT_MIN_DELAY_MS, 800),
@@ -46,6 +48,7 @@ export const behaviorConfig = {
     enabled: process.env.AUTO_AUTH !== 'false',
     autoRegister: process.env.AUTO_REGISTER !== 'false',
     autoLogin: process.env.AUTO_LOGIN !== 'false',
+    requireCaptcha: process.env.REQUIRE_CAPTCHA === 'true',
     registerCommand:
       process.env.REGISTER_COMMAND || '/register JarvisCool2k26!!! JarvisCool2k26!!!',
     loginCommand: process.env.LOGIN_COMMAND || '/login JarvisCool2k26!!!',
@@ -62,5 +65,7 @@ export const behaviorConfig = {
 };
 
 export const logConfig = {
-  level: process.env.LOG_LEVEL || 'info',
+  level: process.env.LOG_LEVEL || 'warn',
+  chatOnly: process.env.LOG_CHAT_ONLY !== 'false',
+  showChat: process.env.LOG_SHOW_CHAT !== 'false',
 };
