@@ -11,6 +11,108 @@ import { enableAutonomousBrain } from './autonomy.js';
 
 const COMMAND_TERMINAL_KEY = Symbol.for('jarvis.commandTerminal');
 
+function createPromptScheduler(rl, outputStream, logger) {
+  const stream = outputStream && typeof outputStream.once === 'function' ? outputStream : process.stdout;
+  let closed = false;
+  let pendingTimeout = null;
+  let waitingForDrain = false;
+  let drainTarget = null;
+  let drainListener = null;
+  let lastRefresh = Date.now();
+
+  function runPrompt() {
+    if (closed) return;
+    try {
+      rl.resume?.();
+      rl.prompt(true);
+      lastRefresh = Date.now();
+    } catch (err) {
+      logger?.command?.(`Prompt refresh failed: ${err?.message ?? err}`);
+    }
+  }
+
+  function detachDrainListener() {
+    if (!waitingForDrain) return;
+    waitingForDrain = false;
+    const target = drainTarget;
+    drainTarget = null;
+    if (!target || !drainListener) {
+      drainListener = null;
+      return;
+    }
+    if (typeof target.off === 'function') {
+      target.off('drain', drainListener);
+    } else if (typeof target.removeListener === 'function') {
+      target.removeListener('drain', drainListener);
+    }
+    drainListener = null;
+  }
+
+  function schedule() {
+    if (closed) return;
+    if (pendingTimeout || waitingForDrain) return;
+
+    const target = stream && typeof stream.once === 'function' ? stream : process.stdout;
+
+    if (target?.writableNeedDrain) {
+      waitingForDrain = true;
+      drainTarget = target;
+      drainListener = () => {
+        detachDrainListener();
+        if (closed) return;
+        pendingTimeout = setTimeout(() => {
+          pendingTimeout = null;
+          runPrompt();
+        }, 0);
+      };
+      target.once('drain', drainListener);
+      return;
+    }
+
+    pendingTimeout = setTimeout(() => {
+      pendingTimeout = null;
+      runPrompt();
+    }, 0);
+  }
+
+  function cancel() {
+    if (pendingTimeout) {
+      clearTimeout(pendingTimeout);
+      pendingTimeout = null;
+    }
+    detachDrainListener();
+  }
+
+  function flush() {
+    cancel();
+    runPrompt();
+  }
+
+  const keepAliveIntervalMs = 15000;
+  const keepAliveTimer = setInterval(() => {
+    if (closed) {
+      clearInterval(keepAliveTimer);
+      return;
+    }
+    if (Date.now() - lastRefresh >= keepAliveIntervalMs) {
+      schedule();
+    }
+  }, Math.max(keepAliveIntervalMs / 3, 2000));
+
+  function stop() {
+    closed = true;
+    cancel();
+    clearInterval(keepAliveTimer);
+  }
+
+  return {
+    schedule,
+    cancel,
+    flush,
+    stop,
+  };
+}
+
 function randomDelay(min, max) {
   const low = Math.min(min, max);
   const high = Math.max(min, max);
@@ -223,27 +325,17 @@ function setupCommandTerminal(bot, logger) {
   const promptText = '> ';
   rl.setPrompt(promptText);
   let closed = false;
-  let refreshHandle = null;
   const consoleState = console.__jarvisConsoleState;
+  const outputStream = rl.output ?? process.stdout;
+  const promptScheduler = createPromptScheduler(rl, outputStream, logger);
+
   const schedulePromptRefresh = () => {
     if (closed) return;
-    if (refreshHandle) return;
-    refreshHandle = setImmediate(() => {
-      refreshHandle = null;
-      if (closed) return;
-      try {
-        rl.resume?.();
-        rl.prompt(true);
-      } catch (err) {
-        logger.command?.(`Prompt refresh failed: ${err?.message ?? err}`);
-      }
-    });
+    promptScheduler.schedule();
   };
 
   const cancelScheduledRefresh = () => {
-    if (!refreshHandle) return;
-    clearImmediate(refreshHandle);
-    refreshHandle = null;
+    promptScheduler.cancel();
   };
 
   const stdinErrorHandler = (err) => {
@@ -263,7 +355,10 @@ function setupCommandTerminal(bot, logger) {
     clearBot() {
       state.bot = null;
     },
-    refreshPrompt: schedulePromptRefresh,
+    refreshPrompt: () => {
+      if (closed) return;
+      promptScheduler.flush();
+    },
     isClosed: () => closed,
     rl,
   };
@@ -306,6 +401,7 @@ function setupCommandTerminal(bot, logger) {
     logger.command?.('Command terminal closed.');
     delete globalThis[COMMAND_TERMINAL_KEY];
     consoleState?.setPromptRefresher?.(null);
+    promptScheduler.stop();
     if (typeof process.stdin.off === 'function') {
       process.stdin.off('error', stdinErrorHandler);
     } else if (typeof process.stdin.removeListener === 'function') {
